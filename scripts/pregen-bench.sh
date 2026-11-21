@@ -12,6 +12,7 @@
 #
 # For cleaner numbers: close the game/browser, and keep the machine otherwise idle.
 set -uo pipefail
+export LC_ALL=C  # sort and join must agree on ordering
 cd "$(dirname "$0")/.."
 
 PAIRS="${1:-3}"

@@ -101,3 +101,9 @@ loom {
 		}
 	}
 }
+
+// Benchmark servers run on Java 21 (closest available to 1.18.2's Java 17), not on the
+// JDK running Gradle.
+tasks.matching { it.name.startsWith("runPregen") }.configureEach {
+	javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) }
+}
