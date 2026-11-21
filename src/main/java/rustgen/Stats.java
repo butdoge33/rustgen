@@ -18,7 +18,7 @@ public final class Stats {
 
 	public static String summary() {
 		long n = Math.max(1, DOFILL_COUNT.sum());
-		return String.format("doFill %.2f ms/chunk (n=%d) [beardifier %.2f, native call %.2f, aquifer+placement %.2f]",
+		return String.format("doFill %.2f ms/chunk (n=%d) [beardifier %.2f, native (noise+aquifer+ores) %.2f, placement %.2f]",
 				DOFILL_NANOS.sum() / 1e6 / n, DOFILL_COUNT.sum(), BEARD_NANOS.sum() / 1e6 / n, NATIVE_NANOS.sum() / 1e6 / n,
 				PLACE_NANOS.sum() / 1e6 / n);
 	}

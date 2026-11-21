@@ -3,8 +3,6 @@ package rustgen;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
-import com.mojang.serialization.Codec;
-
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.StructureFeatureManager;
@@ -29,18 +27,16 @@ import org.slf4j.LoggerFactory;
 
 import rustgen.mixin.BeardifierAccessor;
 import rustgen.mixin.NoiseChunkAccessor;
-import rustgen.mixin.OreVeinifierInvoker;
 
 /**
- * Drop-in replacement for NoiseBasedChunkGenerator.doFill: noise sampling is native,
- * everything else (aquifer, ore-vein rule, block placement, heightmaps, light, fluid
- * post-processing) runs vanilla code in vanilla's iteration order.
+ * Drop-in replacement for NoiseBasedChunkGenerator.doFill. Density, aquifer and ore veins
+ * are computed natively (one call per chunk, returning a block-state code per block); the
+ * placement loop (sections, heightmaps, light sources, fluid post-processing) is vanilla's,
+ * in vanilla's iteration order.
  */
 public final class NativeFill {
 	private static final Logger LOG = LoggerFactory.getLogger("rustgen");
 	private static final BlockState AIR = Blocks.AIR.defaultBlockState();
-	private static final int[] NO_ROOTS = {};
-	private static final double[][] NO_ARRAYS = {};
 
 	public static final AtomicLong NATIVE_CHUNKS = new AtomicLong();
 	public static final AtomicLong VANILLA_CHUNKS = new AtomicLong();
@@ -74,9 +70,10 @@ public final class NativeFill {
 		double[] beard = beardifier(nc, buf, ctx, height);
 		long tNative = System.nanoTime();
 		Stats.BEARD_NANOS.add(tNative - tBeard);
+		byte[] codes = buf.codes;
 		try {
 			int[] params = {minX, minZ, cellNoiseMinY, cellCountY, 16 / cellW, cellW, cellH};
-			nr.density.fillChunk(NativeRouter.FINAL, params, beard, buf.density, nr.veins ? NativeRouter.VEINS : NO_ROOTS, nr.veins ? buf.veins : NO_ARRAYS, nr.veins);
+			nr.density.fillChunkStates(NativeRouter.FINAL, params, beard, nr.matInts, nr.matLongs, nr.matDoubles, codes, null);
 		} catch (RuntimeException e) {
 			if (NATIVE_ERROR_LOGGED.compareAndSet(false, true)) {
 				LOG.error("[rustgen] native noise fill failed for chunk {}; using vanilla (further errors not logged)", chunk.getPos(), e);
@@ -84,23 +81,16 @@ public final class NativeFill {
 			VANILLA_CHUNKS.incrementAndGet();
 			return false;
 		}
-
 		long tPlace = System.nanoTime();
 		Stats.NATIVE_NANOS.add(tPlace - tNative);
-		Aquifer aquifer = nc.aquifer();
-		NoiseChunk.BlockStateFiller ores = nr.veins
-				? OreVeinifierInvoker.rustgen$create(new ArrayFunction(buf.veins[0], ctx), new ArrayFunction(buf.veins[1], ctx),
-						new ArrayFunction(buf.veins[2], ctx), router.oreVeinsPositionalRandomFactory())
-				: null;
-		double[] density = buf.density;
 
-		// --- vanilla doFill loop, with getInterpolatedState() replaced ---
+		// --- vanilla doFill placement loop; block states come from the native codes ---
+		BlockState[] table = nr.codeStates;
 		Heightmap oceanFloor = chunk.getOrCreateHeightmapUnprimed(Heightmap.Types.OCEAN_FLOOR_WG);
 		Heightmap worldSurface = chunk.getOrCreateHeightmapUnprimed(Heightmap.Types.WORLD_SURFACE_WG);
 		BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
 		boolean voidTerrain = SharedConstants.debugVoidTerrain(chunk.getPos());
 		int cellsXZ = 16 / cellW;
-
 		for (int q = 0; q < cellsXZ; q++) {
 			for (int r = 0; r < cellsXZ; r++) {
 				LevelChunkSection section = chunk.getSection(chunk.getSectionsCount() - 1);
@@ -118,13 +108,8 @@ public final class NativeFill {
 							for (int dz = 0; dz < cellW; dz++) {
 								int z = minZ + r * cellW + dz;
 								int lz = z & 15;
-								ctx.set(x, y, z);
-
-								// MaterialRuleList(aquifer rule, ore veinifier)
-								BlockState state = aquifer.computeSubstance(ctx, density[ctx.idx]);
-								if (state == null && ores != null) state = ores.calculate(ctx);
-								if (state == null) state = defaultBlock;
-
+								int code = codes[((y - minY) * 16 + (z - minZ)) * 16 + (x - minX)];
+								BlockState state = table[code & 0x7f];
 								if (state != AIR && !voidTerrain) {
 									if (state.getLightEmission() != 0 && chunk instanceof ProtoChunk proto) {
 										pos.set(x, y, z);
@@ -133,7 +118,7 @@ public final class NativeFill {
 									section.setBlockState(lx, ly, lz, state, false);
 									oceanFloor.update(lx, y, lz, state);
 									worldSurface.update(lx, y, lz, state);
-									if (aquifer.shouldScheduleFluidUpdate() && !state.getFluidState().isEmpty()) {
+									if ((code & 0x80) != 0 && !state.getFluidState().isEmpty()) {
 										pos.set(x, y, z);
 										chunk.markPosForPostprocessing(pos);
 									}
@@ -167,7 +152,7 @@ public final class NativeFill {
 		return out;
 	}
 
-	/** Mutable block context; {@link #idx} is the index into the native output arrays. */
+	/** Mutable block context; {@link #idx} is the index into the native arrays. */
 	static final class Ctx implements DensityFunction.FunctionContext {
 		int minX, minY, minZ, x, y, z, idx;
 
@@ -187,43 +172,18 @@ public final class NativeFill {
 		@Override public int blockX() { return x; }
 		@Override public int blockY() { return y; }
 		@Override public int blockZ() { return z; }
-		// getBlender() defaults to Blender.empty(), matching the NoiseChunk in the native path.
-	}
-
-	/** Exposes a natively computed per-block array as a density function for vanilla rules. */
-	static final class ArrayFunction implements DensityFunction {
-		private final double[] values;
-		private final Ctx ctx;
-
-		ArrayFunction(double[] values, Ctx ctx) {
-			this.values = values;
-			this.ctx = ctx;
-		}
-
-		@Override
-		public double compute(FunctionContext c) {
-			if (c != ctx) throw new IllegalStateException("rustgen ArrayFunction used outside its chunk loop");
-			return values[ctx.idx];
-		}
-
-		@Override public void fillArray(double[] ds, ContextProvider p) { throw new UnsupportedOperationException(); }
-		@Override public DensityFunction mapAll(Visitor v) { return this; }
-		@Override public double minValue() { return Double.NEGATIVE_INFINITY; }
-		@Override public double maxValue() { return Double.POSITIVE_INFINITY; }
-		@Override public Codec<? extends DensityFunction> codec() { throw new UnsupportedOperationException(); }
 	}
 
 	/** Per-thread scratch arrays, reused across chunks (worldgen runs on a fixed thread pool). */
 	static final class Buffers {
 		final Ctx ctx = new Ctx();
-		double[] density = new double[0], beard = new double[0];
-		double[][] veins = new double[3][0];
+		double[] beard = new double[0];
+		byte[] codes = new byte[0];
 
 		Buffers ensure(int volume) {
-			if (density.length != volume) {
-				density = new double[volume];
+			if (codes.length != volume) {
 				beard = new double[volume];
-				veins = new double[][] {new double[volume], new double[volume], new double[volume]};
+				codes = new byte[volume];
 			}
 			return this;
 		}

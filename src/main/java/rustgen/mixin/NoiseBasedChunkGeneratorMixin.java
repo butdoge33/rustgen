@@ -64,7 +64,7 @@ public abstract class NoiseBasedChunkGeneratorMixin {
 			synchronized (this) {
 				if (!rustgen$initialized) {
 					String name = settings.unwrapKey().map(k -> k.location().toString()).orElse("<inline settings>");
-					rustgen$native = NativeRouter.create(this, router, settings.value(), name);
+					rustgen$native = NativeRouter.create(this, router, settings.value(), globalFluidPicker, name);
 					rustgen$initialized = true; // volatile write publishes rustgen$native
 				}
 			}

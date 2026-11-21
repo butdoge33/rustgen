@@ -21,6 +21,8 @@
 //! Items may only reference items defined *earlier*, which the parser enforces;
 //! the graph is therefore acyclic by construction.
 
+#[path = "aquifer.rs"]
+pub mod aquifer;
 #[path = "batch.rs"]
 mod batch;
 
@@ -372,6 +374,13 @@ pub struct ChunkOut<'a> {
     /// only computed where vanilla's OreVeinifier can read them (see [`vein_needs`]);
     /// everything else is NaN.
     pub lazy_veins: bool,
+    /// Block-state rules (aquifer + ore veins): one [`aquifer::code`] byte per block.
+    pub material: Option<Material<'a>>,
+}
+
+pub struct Material<'a> {
+    pub cfg: &'a aquifer::MaterialConfig,
+    pub codes: &'a mut [u8],
 }
 
 /// Vanilla OreVeinifier.VeinType bands: IRON -60..=-8 (toggle <= 0), COPPER 0..=50 (toggle > 0).
@@ -797,6 +806,25 @@ impl Program {
             return Err(format!("array length mismatch: expected {vol}"));
         }
         self.check_chunk(final_root).map_err(|e| format!("final density: {e}"))?;
+        if let Some(m) = &out.material {
+            if m.codes.len() != vol {
+                return Err(format!("codes length mismatch: expected {vol}"));
+            }
+            let c = m.cfg;
+            for r in [c.barrier, c.floodedness, c.spread, c.lava, c.initial_density] {
+                if r as usize >= self.nodes.len() {
+                    return Err(format!("invalid aquifer root node {r}"));
+                }
+            }
+            if c.aquifers_enabled {
+                self.check_surface_root(c.initial_density).map_err(|e| format!("surface root: {e}"))?;
+            }
+            if let Some(v) = &c.veins {
+                for r in [v.toggle, v.ridged, v.gap] {
+                    self.check_chunk(r).map_err(|e| format!("vein root node {r}: {e}"))?;
+                }
+            }
+        }
         for (r, _) in &out.extra {
             self.check_chunk(*r).map_err(|e| format!("root node {r}: {e}"))?;
         }
@@ -807,6 +835,11 @@ impl Program {
         self.collect_interpolators(final_root, &mut interps, &mut seen);
         for (r, _) in &out.extra {
             self.collect_interpolators(*r, &mut interps, &mut seen);
+        }
+        if let Some(v) = out.material.as_ref().and_then(|m| m.cfg.veins.as_ref()) {
+            for r in [v.toggle, v.ridged, v.gap] {
+                self.collect_interpolators(r, &mut interps, &mut seen);
+            }
         }
         let mut slot_of = vec![u32::MAX; self.nodes.len()];
         for (slot, &n) in interps.iter().enumerate() {
@@ -907,6 +940,10 @@ impl Program {
         }
         let mut extra = out.extra;
         let density = out.density;
+        let mut material = out.material;
+        let mut aquifer = material
+            .as_ref()
+            .map(|m| aquifer::Aquifer::new(self, m.cfg, p.min_block_x, p.min_block_z, min_y, p.height() as i32));
 
         // Block positions of one cell: (x, y, z, dx, dy, dz, output index).
         let mut cell_pos: Vec<(i32, i32, i32, f64, f64, f64, usize)> = Vec::with_capacity((w * w * h) as usize);
@@ -976,6 +1013,10 @@ impl Program {
                             density[l.6] = buf[k] + beardifier.map_or(0.0, |b| b[l.6]);
                         }
 
+                        if let (Some(m), Some(aq)) = (material.as_mut(), aquifer.as_mut()) {
+                            self.cell_materials(&mut bt, lanes, density, m, aq, &shared, &mut buf, &mut buf2);
+                        }
+
                         if extra.is_empty() {
                             continue;
                         }
@@ -1029,6 +1070,111 @@ impl Program {
             }
         }
         Ok(())
+    }
+}
+
+impl Program {
+    /// MaterialRuleList(aquifer rule, ore veinifier) for one batch of blocks, then the
+    /// default block. `density` already holds cacheAllInCell(add(finalDensity, beardifier)).
+    #[allow(clippy::too_many_arguments)]
+    fn cell_materials(
+        &self,
+        bt: &mut batch::Batch,
+        lanes: &[(i32, i32, i32, f64, f64, f64, usize)],
+        density: &[f64],
+        m: &mut Material,
+        aq: &mut aquifer::Aquifer,
+        shared: &batch::Shared,
+        buf: &mut [f64; batch::L],
+        buf2: &mut [f64; batch::L],
+    ) {
+        use aquifer::code;
+        let codes = &mut *m.codes;
+
+        // 1. Aquifer rule (vanilla calls it for every block).
+        let mut solid = batch::Lanes::new();
+        for (k, l) in lanes.iter().enumerate() {
+            let (state, update) = aq.compute(l.0, l.1, l.2, density[l.6]);
+            let flag = if update { code::FLUID_UPDATE } else { 0 };
+            codes[l.6] = match state {
+                Some(f) => f.code_with(flag),
+                None => {
+                    solid.push(k);
+                    code::DEFAULT_BLOCK | flag
+                }
+            };
+        }
+        let Some(v) = &m.cfg.veins else { return };
+        if solid.is_empty() {
+            return;
+        }
+
+        // 2. Ore veinifier on blocks the aquifer left solid. Values come from the
+        //    per-block (updateForY/X/Z) interpolation path, as for OreVeinifier in vanilla.
+        if let Some(bl) = bt.block.as_mut() {
+            bl.lerp3 = false;
+        }
+        shared.next();
+        // Outside both vein bands the rule returns null whatever the toggle is.
+        let mut in_band = batch::Lanes::new();
+        for &k in solid.lanes() {
+            let y = lanes[k as usize].1;
+            if y >= aquifer::IRON.min_y && y <= aquifer::COPPER.max_y {
+                in_band.push(k as usize);
+            }
+        }
+        if in_band.is_empty() {
+            return;
+        }
+        self.evb(v.toggle, bt, in_band.act(), buf);
+
+        let mut rngs: [Option<crate::random::Xoroshiro>; batch::L] = std::array::from_fn(|_| None);
+        let mut kinds: [Option<(&aquifer::VeinType, f64)>; batch::L] = [None; batch::L];
+        let mut need_ridged = batch::Lanes::new();
+        for &k in in_band.lanes() {
+            let k = k as usize;
+            let l = &lanes[k];
+            let Some(kind) = aquifer::vein_stage1(buf[k], l.1) else { continue };
+            let mut rng = aquifer::ore_random(v, l.0, l.1, l.2);
+            if rng.next_float() > 0.7f32 {
+                continue;
+            }
+            rngs[k] = Some(rng);
+            kinds[k] = Some(kind);
+            need_ridged.push(k);
+        }
+        if need_ridged.is_empty() {
+            return;
+        }
+        self.evb(v.ridged, bt, need_ridged.act(), buf);
+
+        let mut need_gap = batch::Lanes::new();
+        for &k in need_ridged.lanes() {
+            let k = k as usize;
+            if buf[k] >= 0.0 {
+                continue; // rule yields null -> default block
+            }
+            let (vt, e) = kinds[k].unwrap();
+            let rng = rngs[k].as_mut().unwrap();
+            if (rng.next_float() as f64) < aquifer::vein_richness(e) {
+                need_gap.push(k); // `&&` continues to the gap check
+            } else {
+                codes[lanes[k].6] = vt.filler;
+            }
+        }
+        if need_gap.is_empty() {
+            return;
+        }
+        self.evb(v.gap, bt, need_gap.act(), buf2);
+        for &k in need_gap.lanes() {
+            let k = k as usize;
+            let (vt, _) = kinds[k].unwrap();
+            codes[lanes[k].6] = if buf2[k] > (-0.3f32) as f64 {
+                if rngs[k].as_mut().unwrap().next_float() < 0.02f32 { vt.raw } else { vt.ore }
+            } else {
+                vt.filler
+            };
+        }
     }
 }
 

@@ -8,7 +8,11 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.List;
 
+import net.minecraft.core.Holder;
 import net.minecraft.data.BuiltinRegistries;
+import net.minecraft.world.level.biome.MultiNoiseBiomeSource;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.block.Blocks;
@@ -161,6 +165,97 @@ class ChunkParityTest {
 			}
 		}
 		System.out.println("[rustgen] chunk parity: " + blocks + " blocks x 4 values compared bit-exact");
+	}
+
+	/**
+	 * Block states + fluid-update flags: the full native noise stage (density, aquifer,
+	 * ore veins) against vanilla NoiseChunk.getInterpolatedState() driven like doFill, using
+	 * real generators so the fluid picker and random factories are the game's own.
+	 */
+	@Test
+	void blockStatesMatchVanilla() throws Exception {
+		long blocks = 0;
+		Method interpolatedState = NoiseChunk.class.getDeclaredMethod("getInterpolatedState");
+		interpolatedState.setAccessible(true);
+		for (ResourceKey<NoiseGeneratorSettings> key : PRESETS) {
+			Holder<NoiseGeneratorSettings> holder = BuiltinRegistries.NOISE_GENERATOR_SETTINGS.getHolderOrThrow(key);
+			NoiseGeneratorSettings settings = holder.value();
+			MultiNoiseBiomeSource.Preset preset = key == NoiseGeneratorSettings.NETHER ? MultiNoiseBiomeSource.Preset.NETHER : MultiNoiseBiomeSource.Preset.OVERWORLD;
+			for (long seed : SEEDS) {
+				NoiseBasedChunkGenerator gen = new NoiseBasedChunkGenerator(BuiltinRegistries.STRUCTURE_SETS, BuiltinRegistries.NOISE,
+						preset.biomeSource(BuiltinRegistries.BIOME), seed, holder);
+				NoiseRouter router = (NoiseRouter) field(gen, "router");
+				Aquifer.FluidPicker picker = (Aquifer.FluidPicker) field(gen, "globalFluidPicker");
+				NativeRouter nr = NativeRouter.create(gen, router, settings, picker, key.location().toString());
+				org.junit.jupiter.api.Assertions.assertNotNull(nr, key.location() + " should be supported natively");
+
+				for (int[] c : CHUNKS) {
+					String where = key.location().getPath() + " seed=" + seed + " chunk=" + c[0] + "," + c[1];
+					NoiseChunk nc = vanillaNoiseChunk(settings, router, picker, c[0], c[1]);
+					int[] p = params(settings, c[0], c[1]);
+					int cellW = p[5], cellH = p[6], cellMinY = p[2], cellCountY = p[3];
+					int minX = p[0], minZ = p[1], minY = cellMinY * cellH, height = cellCountY * cellH;
+					byte[] codes = new byte[256 * height];
+					nr.density.fillChunkStates(NativeRouter.FINAL, p, null, nr.matInts, nr.matLongs, nr.matDoubles, codes, null);
+
+					// --- doFill call sequence ---
+					nc.initializeForFirstCellX();
+					for (int q = 0; q < 16 / cellW; q++) {
+						nc.advanceCellX(q);
+						for (int r = 0; r < 16 / cellW; r++) {
+							for (int s = cellCountY - 1; s >= 0; s--) {
+								nc.selectCellYZ(s, r);
+								for (int t = cellH - 1; t >= 0; t--) {
+									int y = (cellMinY + s) * cellH + t;
+									nc.updateForY(y, (double) t / cellH);
+									for (int dx = 0; dx < cellW; dx++) {
+										int x = minX + q * cellW + dx;
+										nc.updateForX(x, (double) dx / cellW);
+										for (int dz = 0; dz < cellW; dz++) {
+											int z = minZ + r * cellW + dz;
+											nc.updateForZ(z, (double) dz / cellW);
+											BlockState expected = (BlockState) interpolatedState.invoke(nc);
+											if (expected == null) expected = settings.defaultBlock();
+											boolean expectedFlag = nc.aquifer().shouldScheduleFluidUpdate();
+											int code = codes[((y - minY) * 16 + (z - minZ)) * 16 + (x - minX)];
+											BlockState actual = nr.codeStates[code & 0x7f];
+											boolean actualFlag = (code & 0x80) != 0;
+											if (expected != actual || expectedFlag != actualFlag) {
+												fail(where + " at " + x + "," + y + "," + z + ": vanilla " + expected + " (update=" + expectedFlag
+														+ ") native " + actual + " (update=" + actualFlag + ", code " + (code & 0xff) + ")");
+											}
+										}
+									}
+								}
+							}
+						}
+						nc.swapSlices();
+					}
+					nc.stopInterpolation();
+					blocks += codes.length;
+				}
+				// The native program is freed when its generator becomes unreachable (as in-game).
+				java.lang.ref.Reference.reachabilityFence(gen);
+			}
+		}
+		System.out.println("[rustgen] block-state parity: " + blocks + " blocks (state + fluid flag) identical");
+	}
+
+	private static Object field(Object o, String name) throws ReflectiveOperationException {
+		java.lang.reflect.Field f = o.getClass().getDeclaredField(name);
+		f.setAccessible(true);
+		return f.get(o);
+	}
+
+	/** NoiseChunk as forChunk builds it (no structures, Blender.empty()), with the generator's fluid picker. */
+	static NoiseChunk vanillaNoiseChunk(NoiseGeneratorSettings settings, NoiseRouter router, Aquifer.FluidPicker picker, int chunkX, int chunkZ)
+			throws Exception {
+		int[] p = params(settings, chunkX, chunkZ);
+		Constructor<NoiseChunk> ctor = NoiseChunk.class.getDeclaredConstructor(int.class, int.class, int.class, NoiseRouter.class,
+				int.class, int.class, DensityFunctions.BeardifierOrMarker.class, NoiseGeneratorSettings.class,
+				Aquifer.FluidPicker.class, Blender.class);
+		ctor.setAccessible(true);
+		return ctor.newInstance(p[4], p[3], p[2], router, p[0], p[1], beardifierMarker(), settings, picker, Blender.empty());
 	}
 
 	/** Exact vanilla OreVeinifier read conditions (VeinType bands, 0.4F threshold). */

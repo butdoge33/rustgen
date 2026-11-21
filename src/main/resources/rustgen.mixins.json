@@ -5,13 +5,14 @@
 	"mixins": [
 		"BeardifierAccessor",
 		"BlendedNoiseAccessor",
+		"FluidStatusAccessor",
 		"ImprovedNoiseAccessor",
 		"NoiseBasedChunkGeneratorMixin",
 		"NoiseChunkAccessor",
 		"NormalNoiseAccessor",
-		"OreVeinifierInvoker",
 		"PerlinNoiseAccessor",
-		"ServerChunkCacheInvoker"
+		"ServerChunkCacheInvoker",
+		"XoroshiroPositionalAccessor"
 	],
 	"injectors": {
 		"defaultRequire": 1

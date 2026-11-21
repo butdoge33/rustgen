@@ -110,6 +110,12 @@ impl Xoroshiro {
         ((m as i64) >> 32) as i32
     }
 
+    /// XoroshiroRandomSource.nextFloat()
+    #[inline]
+    pub fn next_float(&mut self) -> f32 {
+        self.next_bits(24) as f32 * 5.9604645E-8f32
+    }
+
     #[inline]
     pub fn next_double(&mut self) -> f64 {
         self.next_bits(53) as f64 * 1.110_223_024_625_156_5E-16

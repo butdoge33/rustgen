@@ -22,7 +22,7 @@ use perlin::{NormalNoise, PerlinNoise};
 use random::Xoroshiro;
 
 /// Must match NativeLib.EXPECTED_ABI. Bump on any JNI signature change.
-pub const ABI_VERSION: jint = 5;
+pub const ABI_VERSION: jint = 6;
 
 /// Runs `f`, converting both JNI errors and panics into Java exceptions.
 fn guard<R: Default>(env: &mut JNIEnv, f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<R>) -> R {
@@ -334,13 +334,112 @@ pub extern "system" fn Java_rustgen_NativeDensity_fillChunk(
         let mut extra_bufs: Vec<Vec<f64>> = (0..n_extra).map(|_| vec![0.0; vol]).collect();
         let extra = roots.iter().map(|&r| root_node(r)).zip(extra_bufs.iter_mut().map(|v| v.as_mut_slice())).collect();
         program
-            .fill_chunk(p, root_node(final_root), beard.as_deref(), density::ChunkOut { density: &mut density, extra, lazy_veins: lazy_veins != 0 })
+            .fill_chunk(p, root_node(final_root), beard.as_deref(), density::ChunkOut { density: &mut density, extra, lazy_veins: lazy_veins != 0, material: None })
             .unwrap_or_else(|e| panic!("{e}"));
 
         env.set_double_array_region(&density_out, 0, &density)?;
         for (i, buf) in extra_bufs.iter().enumerate() {
             let arr: JDoubleArray = env.get_object_array_element(&extra_out, i as i32)?.into();
             env.set_double_array_region(&arr, 0, buf)?;
+        }
+        Ok(())
+    })
+}
+
+/// Returns null if `root` may be used as the preliminary-surface root, else the reason.
+#[no_mangle]
+pub extern "system" fn Java_rustgen_NativeDensity_checkSurfaceRoot(mut env: JNIEnv, _cls: JClass, handle: jlong, root: jint) -> jstring {
+    guard(&mut env, |env| {
+        assert!(handle != 0, "null program handle");
+        // SAFETY: see evalPoints.
+        let program = unsafe { &*(handle as *const density::Program) };
+        let result = match program.root(root as usize) {
+            None => Err(format!("root {root} is unsupported or out of range")),
+            Some(n) => program.check_surface_root(n),
+        };
+        match result {
+            Ok(()) => Ok(std::ptr::null_mut()),
+            Err(msg) => Ok(env.new_string(msg)?.into_raw()),
+        }
+    })
+}
+
+/// Full noise stage for one chunk: density, aquifer and ore veins, producing one
+/// `density::aquifer::code` byte per block. Layouts are documented in NativeDensity.fillChunkStates.
+#[no_mangle]
+pub extern "system" fn Java_rustgen_NativeDensity_fillChunkStates(
+    mut env: JNIEnv, _cls: JClass, handle: jlong, final_root: jint, params: JIntArray, beardifier: JDoubleArray,
+    mat_ints: JIntArray, mat_longs: JLongArray, mat_doubles: JDoubleArray, codes_out: JByteArray, density_out: JDoubleArray,
+) {
+    use density::aquifer::{Fluid, MaterialConfig, VeinConfig};
+    guard(&mut env, |env| {
+        assert!(handle != 0, "null program handle");
+        // SAFETY: see evalPoints.
+        let program = unsafe { &*(handle as *const density::Program) };
+        let root_node = |r: i32| program.root(r as usize).unwrap_or_else(|| panic!("root {r} is unsupported or out of range"));
+
+        let pr = read_ints(env, &params)?;
+        assert_eq!(pr.len(), 7, "params must be [minX, minZ, cellNoiseMinY, cellCountY, cellCountXZ, cellWidth, cellHeight]");
+        let p = density::ChunkParams {
+            min_block_x: pr[0], min_block_z: pr[1], cell_noise_min_y: pr[2], cell_count_y: pr[3],
+            cell_count_xz: pr[4], cell_width: pr[5], cell_height: pr[6],
+        };
+        let mi = read_ints(env, &mat_ints)?;
+        assert_eq!(mi.len(), 20, "material ints must have 20 entries");
+        let mut ml = [0i64; 4];
+        assert_eq!(env.get_array_length(&mat_longs)?, 4, "material longs must have 4 entries");
+        env.get_long_array_region(&mat_longs, 0, &mut ml)?;
+        let md = read_doubles(env, &mat_doubles)?;
+        assert_eq!(md.len(), 2, "material doubles must have 2 entries");
+
+        let cfg = MaterialConfig {
+            aquifers_enabled: mi[0] != 0,
+            sea_level: mi[1],
+            default_fluid: match mi[2] {
+                1 => Fluid::Air,
+                2 => Fluid::Water,
+                3 => Fluid::Lava,
+                f => panic!("invalid default fluid {f}"),
+            },
+            way_below_min_y: mi[3],
+            aquifer_random: random::XoroshiroPositional { seed_lo: ml[0], seed_hi: ml[1] },
+            barrier: root_node(mi[4]),
+            floodedness: root_node(mi[5]),
+            spread: root_node(mi[6]),
+            lava: root_node(mi[7]),
+            initial_density: root_node(mi[8]),
+            surface: density::SlideSettings::new(mi[9], mi[10], mi[11], (md[0], mi[12], mi[13]), (md[1], mi[14], mi[15])),
+            veins: (mi[16] != 0).then(|| VeinConfig {
+                toggle: root_node(mi[17]),
+                ridged: root_node(mi[18]),
+                gap: root_node(mi[19]),
+                random: random::XoroshiroPositional { seed_lo: ml[2], seed_hi: ml[3] },
+            }),
+        };
+
+        let vol = p.volume();
+        let beard = if beardifier.is_null() { None } else { Some(read_doubles(env, &beardifier)?) };
+        let mut density = vec![0.0; vol];
+        let mut codes = vec![0u8; vol];
+        program
+            .fill_chunk(
+                p,
+                root_node(final_root),
+                beard.as_deref(),
+                density::ChunkOut {
+                    density: &mut density,
+                    extra: vec![],
+                    lazy_veins: false,
+                    material: Some(density::Material { cfg: &cfg, codes: &mut codes }),
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // SAFETY: u8 and i8 have identical size and alignment.
+        let signed: &[i8] = unsafe { std::slice::from_raw_parts(codes.as_ptr() as *const i8, codes.len()) };
+        env.set_byte_array_region(&codes_out, 0, signed)?;
+        if !density_out.is_null() {
+            env.set_double_array_region(&density_out, 0, &density)?;
         }
         Ok(())
     })

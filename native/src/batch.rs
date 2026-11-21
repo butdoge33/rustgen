@@ -93,6 +93,10 @@ impl Lanes {
         self.len == 0
     }
     #[inline]
+    pub(super) fn lanes(&self) -> &[u8] {
+        &self.list[..self.len]
+    }
+    #[inline]
     pub(super) fn act_each(&self, f: impl FnMut(usize)) {
         self.act().each(f)
     }

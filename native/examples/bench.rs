@@ -26,7 +26,7 @@ fn main() {
                 } else {
                     vec![]
                 };
-                program.fill_chunk(params(i), final_root, None, ChunkOut { density: &mut d, extra, lazy_veins: with_veins }).unwrap();
+                program.fill_chunk(params(i), final_root, None, ChunkOut { density: &mut d, extra, lazy_veins: with_veins, material: None }).unwrap();
             }
             if !warm {
                 println!("{label:>16}: {:.2} ms/chunk", t.elapsed().as_secs_f64() * 1e3 / chunks as f64);
