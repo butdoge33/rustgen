@@ -3,6 +3,18 @@
 //!
 //! All arithmetic is wrapping to match Java's long/int overflow semantics.
 
+use md5::{Digest, Md5};
+
+/// The subset of vanilla RandomSource used by noise construction.
+/// LegacyRandomSource (nether/end) will implement this later.
+pub trait RandomSource {
+    fn next_long(&mut self) -> i64;
+    fn next_int_bounded(&mut self, bound: i32) -> i32;
+    fn next_double(&mut self) -> f64;
+    /// RandomSource.consumeCount
+    fn consume_count(&mut self, n: i32);
+}
+
 const GOLDEN_RATIO_64: i64 = 0x9E37_79B9_7F4A_7C15_u64 as i64;
 const SILVER_RATIO_64: i64 = 0x6A09_E667_F3BC_C909_u64 as i64;
 
@@ -42,6 +54,20 @@ impl Xoroshiro {
         } else {
             Self { lo, hi }
         }
+    }
+
+    /// XoroshiroRandomSource.fork()
+    pub fn fork(&mut self) -> Xoroshiro {
+        let lo = self.next_long();
+        let hi = self.next_long();
+        Xoroshiro::from_parts(lo, hi)
+    }
+
+    /// XoroshiroRandomSource.forkPositional()
+    pub fn fork_positional(&mut self) -> XoroshiroPositional {
+        let lo = self.next_long();
+        let hi = self.next_long();
+        XoroshiroPositional { seed_lo: lo, seed_hi: hi }
     }
 
     #[inline]
@@ -87,5 +113,56 @@ impl Xoroshiro {
     #[inline]
     pub fn next_double(&mut self) -> f64 {
         self.next_bits(53) as f64 * 1.110_223_024_625_156_5E-16
+    }
+}
+
+impl RandomSource for Xoroshiro {
+    #[inline]
+    fn next_long(&mut self) -> i64 {
+        Xoroshiro::next_long(self)
+    }
+    #[inline]
+    fn next_int_bounded(&mut self, bound: i32) -> i32 {
+        Xoroshiro::next_int_bounded(self, bound)
+    }
+    #[inline]
+    fn next_double(&mut self) -> f64 {
+        Xoroshiro::next_double(self)
+    }
+    fn consume_count(&mut self, n: i32) {
+        for _ in 0..n {
+            Xoroshiro::next_long(self);
+        }
+    }
+}
+
+/// Mth.getSeed(int x, int y, int z)
+#[inline]
+pub fn get_seed(x: i32, y: i32, z: i32) -> i64 {
+    // `x * 3129871` is an *int* multiply in vanilla, widened afterwards.
+    let mut l = (x.wrapping_mul(3_129_871) as i64) ^ (z as i64).wrapping_mul(116_129_781) ^ (y as i64);
+    l = l.wrapping_mul(l).wrapping_mul(42_317_861).wrapping_add(l.wrapping_mul(11));
+    l >> 16
+}
+
+/// XoroshiroRandomSource.XoroshiroPositionalRandomFactory
+#[derive(Clone, Copy, Debug)]
+pub struct XoroshiroPositional {
+    pub seed_lo: i64,
+    pub seed_hi: i64,
+}
+
+impl XoroshiroPositional {
+    /// at(x, y, z)
+    pub fn at(&self, x: i32, y: i32, z: i32) -> Xoroshiro {
+        Xoroshiro::from_parts(get_seed(x, y, z) ^ self.seed_lo, self.seed_hi)
+    }
+
+    /// fromHashOf(String) — MD5 of the UTF-8 string, split big-endian into two longs.
+    pub fn from_hash_of(&self, name: &str) -> Xoroshiro {
+        let h = Md5::digest(name.as_bytes());
+        let lo = i64::from_be_bytes(h[0..8].try_into().unwrap());
+        let hi = i64::from_be_bytes(h[8..16].try_into().unwrap());
+        Xoroshiro::from_parts(lo ^ self.seed_lo, hi ^ self.seed_hi)
     }
 }

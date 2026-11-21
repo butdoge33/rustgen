@@ -17,7 +17,7 @@ import org.slf4j.LoggerFactory;
  */
 public final class NativeLib {
 	/** Must match ABI_VERSION in native/src/lib.rs. Bump on any signature change. */
-	public static final int EXPECTED_ABI = 1;
+	public static final int EXPECTED_ABI = 2;
 
 	private static final Logger LOG = LoggerFactory.getLogger("rustgen");
 	private static final boolean AVAILABLE = load();

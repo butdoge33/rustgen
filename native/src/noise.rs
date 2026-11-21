@@ -6,7 +6,7 @@
 //!  - never use mul_add / FMA
 //!  - never enable fast-math style flags
 
-use crate::random::Xoroshiro;
+use crate::random::RandomSource;
 
 /// SimplexNoise.GRADIENT
 const GRADIENT: [[f64; 3]; 16] = [
@@ -63,7 +63,7 @@ pub struct ImprovedNoise {
 
 impl ImprovedNoise {
     /// new ImprovedNoise(RandomSource)
-    pub fn new(random: &mut Xoroshiro) -> Self {
+    pub fn new<R: RandomSource>(random: &mut R) -> Self {
         let xo = random.next_double() * 256.0;
         let yo = random.next_double() * 256.0;
         let zo = random.next_double() * 256.0;

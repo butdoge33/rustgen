@@ -27,4 +27,35 @@ public final class NativeNoise {
 	 * @param points packed as x0,y0,z0, x1,y1,z1, ... (length = 3 * out.length)
 	 */
 	public static native void improvedNoise(long seed, double yScale, double yMax, double[] points, double[] out);
+
+	/** XoroshiroRandomSource(seed).forkPositional().fromHashOf(name), then nextLong() into {@code out}. */
+	public static native void positionalFromHash(long seed, String name, long[] out);
+
+	/** XoroshiroRandomSource(seed).forkPositional().at(x, y, z), then nextLong() into {@code out}. */
+	public static native void positionalAt(long seed, int x, int y, int z, long[] out);
+
+	/**
+	 * PerlinNoise over XoroshiroRandomSource(seed).
+	 * legacy=false: PerlinNoise.create(...); legacy=true: createLegacyForLegacyNetherBiome(...).
+	 */
+	public static native void perlinNoise(long seed, int firstOctave, double[] amplitudes, boolean legacy, double[] points, double[] out);
+
+	/**
+	 * NormalNoise.create (or createLegacyNetherBiome if legacy) over a random source that is
+	 * XoroshiroRandomSource(seed) if {@code name == null}, else
+	 * XoroshiroRandomSource(seed).forkPositional().fromHashOf(name) — the game's seeding path.
+	 *
+	 * @return maxValue()
+	 */
+	public static native double normalNoise(long seed, String name, int firstOctave, double[] amplitudes, boolean legacy, double[] points, double[] out);
+
+	/**
+	 * new BlendedNoise(random, new NoiseSamplingSettings(...), cellWidth, cellHeight).compute(...)
+	 * with the same random-source rule as {@link #normalNoise}.
+	 *
+	 * @param blocks packed block coords x0,y0,z0, x1,y1,z1, ...
+	 * @return maxValue()
+	 */
+	public static native double blendedNoise(long seed, String name, double xzScale, double yScale, double xzFactor, double yFactor,
+			int cellWidth, int cellHeight, int[] blocks, double[] out);
 }
