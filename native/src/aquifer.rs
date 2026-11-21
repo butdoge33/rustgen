@@ -138,6 +138,9 @@ const SURFACE_OFFSETS: [(i32, i32); 13] = [
 /// Per-chunk aquifer state (NoiseBasedAquifer's caches + NoiseChunk's surface-level cache).
 pub(super) struct Aquifer<'a> {
     p: &'a Program,
+    memo: &'a Memo,
+    pool: &'a super::batch::Pool,
+    shared: &'a super::batch::Shared,
     cfg: &'a MaterialConfig,
     min_gx: i32,
     min_gy: i32,
@@ -153,7 +156,18 @@ pub(super) struct Aquifer<'a> {
 impl<'a> Aquifer<'a> {
     /// NoiseBasedAquifer constructor: `min_y`/`height` are cellNoiseMinY*cellHeight and
     /// cellCountY*cellHeight, as NoiseChunk passes them.
-    pub(super) fn new(p: &'a Program, cfg: &'a MaterialConfig, min_block_x: i32, min_block_z: i32, min_y: i32, height: i32) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        p: &'a Program,
+        cfg: &'a MaterialConfig,
+        min_block_x: i32,
+        min_block_z: i32,
+        min_y: i32,
+        height: i32,
+        memo: &'a Memo,
+        pool: &'a super::batch::Pool,
+        shared: &'a super::batch::Shared,
+    ) -> Self {
         let min_gx = min_block_x.div_euclid(16) - 1;
         let size_x = ((min_block_x + 15).div_euclid(16) + 1) - min_gx + 1;
         let min_gy = min_y.div_euclid(12) - 1;
@@ -163,6 +177,9 @@ impl<'a> Aquifer<'a> {
         let n = (size_x * size_y * size_z) as usize;
         Aquifer {
             p,
+            memo,
+            pool,
+            shared,
             cfg,
             min_gx,
             min_gy,
@@ -391,16 +408,43 @@ impl<'a> Aquifer<'a> {
         let (bx, bz) = (key.0 << 2, key.1 << 2); // QuartPos.toBlock
         let s = self.cfg.surface;
         let mut result = i32::MAX; // (int) 2.147483647E9
-        let mut k = s.min_cell_y + s.cell_count_y;
-        while k >= s.min_cell_y {
-            let l = k * s.cell_height;
-            let e = self.p.eval(self.cfg.initial_density, bx, l, bz) + -0.703125;
-            let f = s.apply(clamp(e, -64.0, 64.0), l);
-            if f > 0.390625 {
-                result = l;
-                break;
+
+        // Vanilla scans cell levels top-down and stops at the first solid one. We evaluate
+        // the levels as point batches (top-down chunks of up to L): the y-independent 2D
+        // parts — what vanilla's per-column caches make cheap — are computed once per batch.
+        // Levels below the answer are computed but unused; everything here is pure.
+        use super::batch::{Act, Batch, L};
+        let top = s.min_cell_y + s.cell_count_y;
+        let mut k0 = top;
+        let mut out = [0.0f64; L];
+        'scan: while k0 >= s.min_cell_y {
+            let n = ((k0 - s.min_cell_y + 1) as usize).min(L);
+            let mut bt = Batch {
+                xs: [bx; L],
+                ys: [0; L],
+                zs: [bz; L],
+                block: None,
+                point: true,
+                uniform_xz: true,
+                memo: self.memo,
+                pool: self.pool,
+                shared: self.shared,
+            };
+            for i in 0..n {
+                bt.ys[i] = (k0 - i as i32) * s.cell_height;
             }
-            k -= 1;
+            self.shared.next();
+            self.p.evb(self.cfg.initial_density, &bt, Act::All(n), &mut out);
+            for i in 0..n {
+                let l = bt.ys[i];
+                let e = out[i] + -0.703125;
+                let f = s.apply(clamp(e, -64.0, 64.0), l);
+                if f > 0.390625 {
+                    result = l;
+                    break 'scan;
+                }
+            }
+            k0 -= n as i32;
         }
         self.surface.insert(key, result);
         result

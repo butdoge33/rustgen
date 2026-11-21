@@ -156,8 +156,11 @@ pub(super) struct Batch<'a> {
     pub(super) xs: [i32; L],
     pub(super) ys: [i32; L],
     pub(super) zs: [i32; L],
-    /// None: interpolator-corner batch (Mode::Corner). Some: block batch (Mode::Block).
+    /// None: interpolator-corner batch (Mode::Corner), or a point batch if `point`.
+    /// Some: block batch (Mode::Block).
     pub(super) block: Option<BlockLanes<'a>>,
+    /// SinglePointContext semantics (Mode::Point): every marker is pass-through.
+    pub(super) point: bool,
     /// All lanes share one (x, z) column, so y-independent subtrees are uniform.
     pub(super) uniform_xz: bool,
     pub(super) memo: &'a Memo,
@@ -202,6 +205,7 @@ impl Program {
     fn scalar_lane(&self, n: u32, b: &Batch, i: usize) -> f64 {
         let (x, y, z) = (b.xs[i], b.ys[i], b.zs[i]);
         match &b.block {
+            None if b.point => self.ev(n, x, y, z, Mode::Point),
             None => {
                 b.memo.stamp.set(b.memo.stamp.get() + 1); // new position for cache_once
                 self.ev(n, x, y, z, Mode::Corner(b.memo))
@@ -290,6 +294,9 @@ impl Program {
                 self.evb(i, b, act, out);
                 act.each(|j| out[j] = clamp(out[j], lo, hi));
             }
+            // Point semantics: all markers pass through (y-independent flat_cache/cache_2d
+            // children were already handled by the uniform path above).
+            Op::Marker(_, i) if b.point => self.evb(i, b, act, out),
             Op::Marker(kind, i) => match (kind, &b.block) {
                 (MARK_INTERPOLATED, Some(bl)) => {
                     let c = &bl.corners[bl.slot_of[n as usize] as usize];

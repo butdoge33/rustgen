@@ -30,7 +30,17 @@ done
 run_one() { # $1 = Native | Vanilla, $2 = pair index
   local mode=$1 i=$2 dir="run/pregen-${1,,}" log="$OUT/$1-$2.log"
   rm -rf "$dir/world" "$dir/rustgen-pregen.txt"
-  timeout 1800 ./gradlew "runPregen$mode" --console=plain > "$log" 2>&1
+  timeout 1200 ./gradlew "runPregen$mode" --console=plain > "$log" 2>&1
+  # The server JVM is forked by the Gradle daemon, so a timeout doesn't stop it; make
+  # sure no server is left holding the port (its command line carries -Drustgen.pregen=).
+  local left
+  left=$(pgrep -f -- '-Drustgen\.pregen=' || true)
+  if [ -n "$left" ]; then
+    # Still running after the timeout: record where it is stuck, then kill it.
+    for pid in $left; do jstack "$pid" > "$OUT/$mode-$i.jstack.txt" 2>&1 || true; done
+    kill -9 $left 2>/dev/null
+    echo "pair $i  $mode  (timed out; thread dump in $OUT/$mode-$i.jstack.txt)" | tee -a "$SUMMARY"
+  fi
   local rate fill
   rate=$(grep -oE '[0-9]+,?[0-9]* chunks/s' "$log" | tail -1)
   fill=$(grep -oE 'doFill [0-9.,]+ ms/chunk' "$log" | tail -1)

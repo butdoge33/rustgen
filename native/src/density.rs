@@ -24,7 +24,7 @@
 #[path = "aquifer.rs"]
 pub mod aquifer;
 #[path = "batch.rs"]
-mod batch;
+pub(crate) mod batch;
 
 use crate::blended::BlendedNoise;
 use crate::noise::{lerp, ImprovedNoise};
@@ -912,6 +912,7 @@ impl Program {
                         ys: [0; batch::L],
                         zs: [bz; batch::L],
                         block: None,
+                        point: false,
                         uniform_xz: true,
                         memo: &memo,
                         pool: &pool,
@@ -941,9 +942,9 @@ impl Program {
         let mut extra = out.extra;
         let density = out.density;
         let mut material = out.material;
-        let mut aquifer = material
-            .as_ref()
-            .map(|m| aquifer::Aquifer::new(self, m.cfg, p.min_block_x, p.min_block_z, min_y, p.height() as i32));
+        let mut aquifer = material.as_ref().map(|m| {
+            aquifer::Aquifer::new(self, m.cfg, p.min_block_x, p.min_block_z, min_y, p.height() as i32, &memo, &pool, &shared)
+        });
 
         // Block positions of one cell: (x, y, z, dx, dy, dz, output index).
         let mut cell_pos: Vec<(i32, i32, i32, f64, f64, f64, usize)> = Vec::with_capacity((w * w * h) as usize);
@@ -999,6 +1000,7 @@ impl Program {
                             ys,
                             zs,
                             block: Some(bl),
+                            point: false,
                             uniform_xz: false,
                             memo: &memo,
                             pool: &pool,

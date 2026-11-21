@@ -306,6 +306,18 @@ class ChunkParityTest {
 		byte[] program = DensityTranslator.translate(router).program();
 		// Saved for the standalone native benchmark (native/examples/bench.rs).
 		java.nio.file.Files.write(java.nio.file.Path.of("build", "overworld-12345.rgdf"), program);
+		{
+			Holder<NoiseGeneratorSettings> holder = BuiltinRegistries.NOISE_GENERATOR_SETTINGS.getHolderOrThrow(NoiseGeneratorSettings.OVERWORLD);
+			NoiseBasedChunkGenerator gen = new NoiseBasedChunkGenerator(BuiltinRegistries.STRUCTURE_SETS, BuiltinRegistries.NOISE,
+					MultiNoiseBiomeSource.Preset.OVERWORLD.biomeSource(BuiltinRegistries.BIOME), 12345L, holder);
+			NativeRouter nr = NativeRouter.create(gen, (NoiseRouter) field(gen, "router"), settings,
+					(Aquifer.FluidPicker) field(gen, "globalFluidPicker"), "bench");
+			String mat = java.util.Arrays.stream(nr.matInts).mapToObj(String::valueOf).collect(java.util.stream.Collectors.joining(" ")) + "\n"
+					+ java.util.Arrays.stream(nr.matLongs).mapToObj(String::valueOf).collect(java.util.stream.Collectors.joining(" ")) + "\n"
+					+ java.util.Arrays.stream(nr.matDoubles).mapToObj(Double::toString).collect(java.util.stream.Collectors.joining(" ")) + "\n";
+			java.nio.file.Files.writeString(java.nio.file.Path.of("build", "overworld-12345.mat"), mat);
+			java.lang.ref.Reference.reachabilityFence(gen);
+		}
 		try (NativeDensity nd = new NativeDensity(program)) {
 			int vol = 16 * 16 * 384;
 			double[] density = new double[vol];
