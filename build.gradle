@@ -77,3 +77,27 @@ java {
 	sourceCompatibility = JavaVersion.VERSION_17
 	targetCompatibility = JavaVersion.VERSION_17
 }
+
+// ---------------------------------------------------------------------------
+// Verification / benchmark servers (see rustgen.debug.PregenHarness).
+// Same seed and area; one native, one vanilla. Compare the rustgen-pregen.txt files.
+//   ./gradlew runPregenNative runPregenVanilla
+// ---------------------------------------------------------------------------
+loom {
+	runs {
+		pregenNative {
+			server()
+			configName = "Pregen (native)"
+			runDir = "run/pregen-native"
+			vmArgs "-Xmx2G", "-Drustgen.pregen=12"
+			programArgs "nogui"
+		}
+		pregenVanilla {
+			server()
+			configName = "Pregen (vanilla)"
+			runDir = "run/pregen-vanilla"
+			vmArgs "-Xmx2G", "-Drustgen.pregen=12", "-Drustgen.disable=true"
+			programArgs "nogui"
+		}
+	}
+}
