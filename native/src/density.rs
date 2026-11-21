@@ -21,6 +21,9 @@
 //! Items may only reference items defined *earlier*, which the parser enforces;
 //! the graph is therefore acyclic by construction.
 
+#[path = "batch.rs"]
+mod batch;
+
 use crate::blended::BlendedNoise;
 use crate::noise::{lerp, ImprovedNoise};
 use crate::perlin::{NormalNoise, PerlinNoise};
@@ -132,6 +135,49 @@ pub struct SlideSettings {
     cell_count_y: i32,
     top: Slider,
     bottom: Slider,
+}
+
+impl SlideSettings {
+    /// NoiseRouterData.applySlide: (int)e / cellHeight is Java int division (truncating).
+    #[inline]
+    fn apply(&self, d: f64, y: i32) -> f64 {
+        let f = (y.wrapping_div(self.cell_height)).wrapping_sub(self.min_cell_y) as f64;
+        let d = self.top.apply(d, self.cell_count_y as f64 - f);
+        self.bottom.apply(d, f)
+    }
+}
+
+/// DensityFunctions.Mapped.transform
+#[inline]
+fn map_value(kind: MapKind, d: f64) -> f64 {
+    match kind {
+        MapKind::Abs => d.abs(),
+        MapKind::Square => d * d,
+        MapKind::Cube => d * d * d,
+        MapKind::HalfNegative => if d > 0.0 { d } else { d * 0.5 },
+        MapKind::QuarterNegative => if d > 0.0 { d } else { d * 0.25 },
+        MapKind::Squeeze => {
+            let e = clamp(d, -1.0, 1.0);
+            e / 2.0 - e * e * e / 24.0
+        }
+    }
+}
+
+/// NoiseInterpolator value for one block. `c` = n000, n100, n010, n110, n001, n101, n011, n111.
+/// lerp3: the `fillingCell` path (Mth.lerp3, x→y→z); otherwise updateForY/X/Z (y→x→z).
+#[inline]
+fn interpolate(c: &[f64; 8], dx: f64, dy: f64, dz: f64, lerp3: bool) -> f64 {
+    if lerp3 {
+        crate::noise::lerp3(dx, dy, dz, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7])
+    } else {
+        let xz00 = lerp(dy, c[0], c[2]);
+        let xz10 = lerp(dy, c[1], c[3]);
+        let xz01 = lerp(dy, c[4], c[6]);
+        let xz11 = lerp(dy, c[5], c[7]);
+        let z0 = lerp(dx, xz00, xz10);
+        let z1 = lerp(dx, xz01, xz11);
+        lerp(dz, z0, z1)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -279,18 +325,7 @@ struct BlockCtx<'a> {
 impl BlockCtx<'_> {
     #[inline]
     fn interpolate(&self, node: u32) -> f64 {
-        let c = &self.corners[self.slot_of[node as usize] as usize];
-        if self.lerp3 {
-            crate::noise::lerp3(self.dx, self.dy, self.dz, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7])
-        } else {
-            let xz00 = lerp(self.dy, c[0], c[2]);
-            let xz10 = lerp(self.dy, c[1], c[3]);
-            let xz01 = lerp(self.dy, c[4], c[6]);
-            let xz11 = lerp(self.dy, c[5], c[7]);
-            let z0 = lerp(self.dx, xz00, xz10);
-            let z1 = lerp(self.dx, xz01, xz11);
-            lerp(self.dz, z0, z1)
-        }
+        interpolate(&self.corners[self.slot_of[node as usize] as usize], self.dx, self.dy, self.dz, self.lerp3)
     }
 }
 
@@ -400,20 +435,7 @@ impl Program {
             }
             Op::AddConst(i, c) => self.ev(i, x, y, z, mode) + c,
             Op::MulConst(i, c) => self.ev(i, x, y, z, mode) * c,
-            Op::Mapped(kind, i) => {
-                let d = self.ev(i, x, y, z, mode);
-                match kind {
-                    MapKind::Abs => d.abs(),
-                    MapKind::Square => d * d,
-                    MapKind::Cube => d * d * d,
-                    MapKind::HalfNegative => if d > 0.0 { d } else { d * 0.5 },
-                    MapKind::QuarterNegative => if d > 0.0 { d } else { d * 0.25 },
-                    MapKind::Squeeze => {
-                        let e = clamp(d, -1.0, 1.0);
-                        e / 2.0 - e * e * e / 24.0
-                    }
-                }
-            }
+            Op::Mapped(kind, i) => map_value(kind, self.ev(i, x, y, z, mode)),
             Op::Clamp(i, lo, hi) => clamp(self.ev(i, x, y, z, mode), lo, hi),
             Op::Marker(kind, i) => match (kind, mode) {
                 (MARK_INTERPOLATED, Mode::Block(b)) => b.interpolate(n),
@@ -477,12 +499,7 @@ impl Program {
                 let d = self.ev(i, x, y, z, mode);
                 match settings {
                     None => d,
-                    Some(s) => {
-                        // NoiseRouterData.applySlide: (int)e / cellHeight is Java int division (truncating).
-                        let f = (y.wrapping_div(s.cell_height)).wrapping_sub(s.min_cell_y) as f64;
-                        let d = s.top.apply(d, s.cell_count_y as f64 - f);
-                        s.bottom.apply(d, f)
-                    }
+                    Some(s) => s.apply(d, y),
                 }
             }
             Op::Spline { spline, min, max } => {
@@ -835,27 +852,51 @@ impl Program {
             stamp: std::cell::Cell::new(0),
         };
 
-        // Slice filling: each interpolator's wrapped function at every cell corner.
+        // Slice filling: each interpolator's wrapped function at every cell corner, batched
+        // per corner column (all interpolators share the batch, like vanilla's per-column
+        // cache_once reuse across interpolators).
         let gidx = |cx: usize, cz: usize, cy: usize| (cx * (nxz + 1) + cz) * (ny + 1) + cy;
-        let mut grids: Vec<Vec<f64>> = Vec::with_capacity(interps.len());
-        for &n in &interps {
-            let child = match self.nodes[n as usize].op {
+        let children: Vec<u32> = interps
+            .iter()
+            .map(|&n| match self.nodes[n as usize].op {
                 Op::Marker(_, c) => c,
                 _ => unreachable!(),
-            };
-            let mut g = vec![0.0; (nxz + 1) * (nxz + 1) * (ny + 1)];
-            for cx in 0..=nxz {
-                let bx = (first_cell_x + cx as i32) * w;
-                for cz in 0..=nxz {
-                    let bz = (first_cell_z + cz as i32) * w;
-                    for cy in 0..=ny {
-                        let by = (cy as i32 + p.cell_noise_min_y) * h;
-                        memo.stamp.set(memo.stamp.get() + 1);
-                        g[gidx(cx, cz, cy)] = self.ev(child, bx, by, bz, Mode::Corner(&memo));
+            })
+            .collect();
+        let mut grids: Vec<Vec<f64>> = vec![vec![0.0; (nxz + 1) * (nxz + 1) * (ny + 1)]; interps.len()];
+        let pool = batch::Pool::new();
+        let shared = batch::Shared::new(self);
+        let mut buf = [0.0f64; batch::L];
+        for cx in 0..=nxz {
+            let bx = (first_cell_x + cx as i32) * w;
+            for cz in 0..=nxz {
+                let bz = (first_cell_z + cz as i32) * w;
+                let mut start = 0;
+                while start <= ny {
+                    let n = (ny + 1 - start).min(batch::L);
+                    let mut bt = batch::Batch {
+                        xs: [bx; batch::L],
+                        ys: [0; batch::L],
+                        zs: [bz; batch::L],
+                        block: None,
+                        uniform_xz: true,
+                        memo: &memo,
+                        pool: &pool,
+                        shared: &shared,
+                    };
+                    for k in 0..n {
+                        bt.ys[k] = ((start + k) as i32 + p.cell_noise_min_y) * h;
                     }
+                    shared.next();
+                    for (slot, &child) in children.iter().enumerate() {
+                        self.evb(child, &bt, batch::Act::All(n), &mut buf);
+                        for k in 0..n {
+                            grids[slot][gidx(cx, cz, start + k)] = buf[k];
+                        }
+                    }
+                    start += n;
                 }
             }
-            grids.push(g);
         }
 
         let min_y = p.cell_noise_min_y * h;
@@ -866,6 +907,10 @@ impl Program {
         }
         let mut extra = out.extra;
         let density = out.density;
+
+        // Block positions of one cell: (x, y, z, dx, dy, dz, output index).
+        let mut cell_pos: Vec<(i32, i32, i32, f64, f64, f64, usize)> = Vec::with_capacity((w * w * h) as usize);
+        let mut buf2 = [0.0f64; batch::L];
 
         for cx in 0..nxz {
             for cz in 0..nxz {
@@ -883,40 +928,99 @@ impl Program {
                             g[gidx(cx + 1, cz + 1, cy + 1)], // n111
                         ];
                     }
+                    cell_pos.clear();
                     for ty in 0..h {
                         let y = (p.cell_noise_min_y + cy as i32) * h + ty;
-                        let dy = ty as f64 / h as f64;
                         for tx in 0..w {
                             let x = (first_cell_x + cx as i32) * w + tx;
-                            let dx = tx as f64 / w as f64;
                             for tz in 0..w {
                                 let z = (first_cell_z + cz as i32) * w + tz;
-                                let dz = tz as f64 / w as f64;
                                 let idx = ((y - min_y) as usize * width + (z - p.min_block_z) as usize) * width
                                     + (x - p.min_block_x) as usize;
+                                cell_pos.push((x, y, z, tx as f64 / w as f64, ty as f64 / h as f64, tz as f64 / w as f64, idx));
+                            }
+                        }
+                    }
 
-                                let cell = BlockCtx { memo: &memo, slot_of: &slot_of, corners: &corners, dx, dy, dz, lerp3: true };
-                                let beard = beardifier.map_or(0.0, |b| b[idx]);
-                                // Ap2(ADD, finalDensity, beardifier): d + e, always (so -0.0 + 0.0 == 0.0 as in vanilla).
-                                density[idx] = self.ev(final_root, x, y, z, Mode::Block(&cell)) + beard;
+                    for lanes in cell_pos.chunks(batch::L) {
+                        let n = lanes.len();
+                        let mut bl = batch::BlockLanes {
+                            slot_of: &slot_of,
+                            corners: &corners,
+                            dx: [0.0; batch::L],
+                            dy: [0.0; batch::L],
+                            dz: [0.0; batch::L],
+                            lerp3: true,
+                        };
+                        let (mut xs, mut ys, mut zs) = ([0; batch::L], [0; batch::L], [0; batch::L]);
+                        for (k, &(x, y, z, dx, dy, dz, _)) in lanes.iter().enumerate() {
+                            (xs[k], ys[k], zs[k]) = (x, y, z);
+                            (bl.dx[k], bl.dy[k], bl.dz[k]) = (dx, dy, dz);
+                        }
+                        let mut bt = batch::Batch {
+                            xs,
+                            ys,
+                            zs,
+                            block: Some(bl),
+                            uniform_xz: false,
+                            memo: &memo,
+                            pool: &pool,
+                            shared: &shared,
+                        };
 
-                                let blk = BlockCtx { lerp3: false, ..cell };
-                                if lazy_veins {
-                                    let (t, rest) = extra.split_at_mut(1);
-                                    let toggle = if y >= VEIN_BAND.0 && y <= VEIN_BAND.1 {
-                                        self.ev(t[0].0, x, y, z, Mode::Block(&blk))
-                                    } else {
-                                        f64::NAN // outside both bands OreVeinifier ignores the toggle value
-                                    };
-                                    t[0].1[idx] = toggle;
-                                    let needed = !toggle.is_nan() && vein_needs(toggle, y);
-                                    for (r, o) in rest.iter_mut() {
-                                        o[idx] = if needed { self.ev(*r, x, y, z, Mode::Block(&blk)) } else { f64::NAN };
-                                    }
+                        // cacheAllInCell(add(finalDensity, beardifier)): the fillingCell (lerp3) path.
+                        shared.next();
+                        self.evb(final_root, &bt, batch::Act::All(n), &mut buf);
+                        for (k, l) in lanes.iter().enumerate() {
+                            // Ap2(ADD, finalDensity, beardifier): d + e, always (so -0.0 + 0.0 == 0.0 as in vanilla).
+                            density[l.6] = buf[k] + beardifier.map_or(0.0, |b| b[l.6]);
+                        }
+
+                        if extra.is_empty() {
+                            continue;
+                        }
+                        // Per-block roots (OreVeinifier): the updateForY/X/Z path.
+                        if let Some(bl) = bt.block.as_mut() {
+                            bl.lerp3 = false;
+                        }
+                        shared.next();
+                        if lazy_veins {
+                            let (t, rest) = extra.split_at_mut(1);
+                            // Outside both vein bands OreVeinifier ignores the toggle value.
+                            let mut in_band = batch::Lanes::new();
+                            for (k, l) in lanes.iter().enumerate() {
+                                if l.1 >= VEIN_BAND.0 && l.1 <= VEIN_BAND.1 {
+                                    in_band.push(k);
                                 } else {
-                                    for (r, o) in extra.iter_mut() {
-                                        o[idx] = self.ev(*r, x, y, z, Mode::Block(&blk));
+                                    t[0].1[l.6] = f64::NAN;
+                                }
+                            }
+                            let mut needed = batch::Lanes::new();
+                            if !in_band.is_empty() {
+                                self.evb(t[0].0, &bt, in_band.act(), &mut buf);
+                                for (k, l) in lanes.iter().enumerate() {
+                                    if l.1 >= VEIN_BAND.0 && l.1 <= VEIN_BAND.1 {
+                                        t[0].1[l.6] = buf[k];
+                                        if !buf[k].is_nan() && vein_needs(buf[k], l.1) {
+                                            needed.push(k);
+                                        }
                                     }
+                                }
+                            }
+                            for (r, o) in rest.iter_mut() {
+                                for l in lanes {
+                                    o[l.6] = f64::NAN;
+                                }
+                                if !needed.is_empty() {
+                                    self.evb(*r, &bt, needed.act(), &mut buf2);
+                                    needed.act_each(|k| o[lanes[k].6] = buf2[k]);
+                                }
+                            }
+                        } else {
+                            for (r, o) in extra.iter_mut() {
+                                self.evb(*r, &bt, batch::Act::All(n), &mut buf);
+                                for (k, l) in lanes.iter().enumerate() {
+                                    o[l.6] = buf[k];
                                 }
                             }
                         }
