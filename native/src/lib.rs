@@ -22,7 +22,7 @@ use perlin::{NormalNoise, PerlinNoise};
 use random::Xoroshiro;
 
 /// Must match NativeLib.EXPECTED_ABI. Bump on any JNI signature change.
-pub const ABI_VERSION: jint = 4;
+pub const ABI_VERSION: jint = 5;
 
 /// Runs `f`, converting both JNI errors and panics into Java exceptions.
 fn guard<R: Default>(env: &mut JNIEnv, f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<R>) -> R {
@@ -309,7 +309,7 @@ pub extern "system" fn Java_rustgen_NativeDensity_checkChunk(mut env: JNIEnv, _c
 #[no_mangle]
 pub extern "system" fn Java_rustgen_NativeDensity_fillChunk(
     mut env: JNIEnv, _cls: JClass, handle: jlong, final_root: jint, extra_roots: JIntArray,
-    params: JIntArray, beardifier: JDoubleArray, density_out: JDoubleArray, extra_out: JObjectArray,
+    params: JIntArray, beardifier: JDoubleArray, density_out: JDoubleArray, extra_out: JObjectArray, lazy_veins: jboolean,
 ) {
     guard(&mut env, |env| {
         assert!(handle != 0, "null program handle");
@@ -334,7 +334,7 @@ pub extern "system" fn Java_rustgen_NativeDensity_fillChunk(
         let mut extra_bufs: Vec<Vec<f64>> = (0..n_extra).map(|_| vec![0.0; vol]).collect();
         let extra = roots.iter().map(|&r| root_node(r)).zip(extra_bufs.iter_mut().map(|v| v.as_mut_slice())).collect();
         program
-            .fill_chunk(p, root_node(final_root), beard.as_deref(), density::ChunkOut { density: &mut density, extra })
+            .fill_chunk(p, root_node(final_root), beard.as_deref(), density::ChunkOut { density: &mut density, extra, lazy_veins: lazy_veins != 0 })
             .unwrap_or_else(|e| panic!("{e}"));
 
         env.set_double_array_region(&density_out, 0, &density)?;

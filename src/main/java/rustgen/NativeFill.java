@@ -76,7 +76,7 @@ public final class NativeFill {
 		Stats.BEARD_NANOS.add(tNative - tBeard);
 		try {
 			int[] params = {minX, minZ, cellNoiseMinY, cellCountY, 16 / cellW, cellW, cellH};
-			nr.density.fillChunk(NativeRouter.FINAL, params, beard, buf.density, nr.veins ? NativeRouter.VEINS : NO_ROOTS, nr.veins ? buf.veins : NO_ARRAYS);
+			nr.density.fillChunk(NativeRouter.FINAL, params, beard, buf.density, nr.veins ? NativeRouter.VEINS : NO_ROOTS, nr.veins ? buf.veins : NO_ARRAYS, nr.veins);
 		} catch (RuntimeException e) {
 			if (NATIVE_ERROR_LOGGED.compareAndSet(false, true)) {
 				LOG.error("[rustgen] native noise fill failed for chunk {}; using vanilla (further errors not logged)", chunk.getPos(), e);

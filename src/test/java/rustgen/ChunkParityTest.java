@@ -143,17 +143,49 @@ class ChunkParityTest {
 						Vanilla van = vanillaChunk(settings, router, c[0], c[1]);
 						double[] density = new double[van.density().length];
 						double[][] veins = new double[3][density.length];
-						nd.fillChunk(FINAL, params(settings, c[0], c[1]), null, density, VEINS, veins);
-
 						String where = key.location().getPath() + " seed=" + seed + " chunk=" + c[0] + "," + c[1];
+
+						// Eager: every vein value everywhere.
+						nd.fillChunk(FINAL, params(settings, c[0], c[1]), null, density, VEINS, veins, false);
 						compare(where + " density", van.density(), density, c, settings);
 						for (int v = 0; v < 3; v++) compare(where + " " + DensityTranslator.ROOT_NAMES[VEINS[v]], van.veins()[v], veins[v], c, settings);
+
+						// Lazy (what the game uses): computed values must match, and everything
+						// vanilla's OreVeinifier can read must have been computed.
+						nd.fillChunk(FINAL, params(settings, c[0], c[1]), null, density, VEINS, veins, true);
+						compare(where + " density (lazy)", van.density(), density, c, settings);
+						checkLazyVeins(where, van.veins(), veins, c, settings);
 						blocks += density.length;
 					}
 				}
 			}
 		}
 		System.out.println("[rustgen] chunk parity: " + blocks + " blocks x 4 values compared bit-exact");
+	}
+
+	/** Exact vanilla OreVeinifier read conditions (VeinType bands, 0.4F threshold). */
+	private static void checkLazyVeins(String where, double[][] expected, double[][] lazy, int[] chunk, NoiseGeneratorSettings settings) {
+		int minY = settings.noiseSettings().minY();
+		for (int i = 0; i < expected[0].length; i++) {
+			int y = i / 256 + minY;
+			double d = expected[0][i];
+			boolean toggleRead = y >= -60 && y <= 50; // outside both bands the toggle value is irrelevant
+			int lo = d > 0.0 ? 0 : -60, hi = d > 0.0 ? 50 : -8;
+			boolean restRead = false;
+			if (y >= lo && y <= hi) {
+				double f = Mth.clampedMap(Math.min(hi - y, y - lo), 0.0, 20.0, -0.2, 0.0);
+				restRead = !(Math.abs(d) + f < 0.4F);
+			}
+			for (int v = 0; v < 3; v++) {
+				boolean read = v == 0 ? toggleRead : restRead;
+				double got = lazy[v][i];
+				if (Double.isNaN(got)) {
+					if (read) fail(where + " lazy " + DensityTranslator.ROOT_NAMES[VEINS[v]] + " not computed at index " + i + " but vanilla reads it");
+				} else if (Double.doubleToRawLongBits(got) != Double.doubleToRawLongBits(expected[v][i])) {
+					fail(where + " lazy " + DensityTranslator.ROOT_NAMES[VEINS[v]] + " mismatch at index " + i);
+				}
+			}
+		}
 	}
 
 	private static void compare(String what, double[] expected, double[] actual, int[] chunk, NoiseGeneratorSettings settings) {
@@ -185,12 +217,12 @@ class ChunkParityTest {
 			double[][] veins = new double[3][vol];
 			for (int i = 0; i < 16; i++) { // warm up both sides
 				vanillaChunk(settings, router, i, 100);
-				nd.fillChunk(FINAL, params(settings, i, 100), null, density, VEINS, veins);
+				nd.fillChunk(FINAL, params(settings, i, 100), null, density, VEINS, veins, true);
 			}
 			long t0 = System.nanoTime();
 			for (int i = 0; i < chunks; i++) vanillaChunk(settings, router, i, -7);
 			long t1 = System.nanoTime();
-			for (int i = 0; i < chunks; i++) nd.fillChunk(FINAL, params(settings, i, -7), null, density, VEINS, veins);
+			for (int i = 0; i < chunks; i++) nd.fillChunk(FINAL, params(settings, i, -7), null, density, VEINS, veins, true);
 			long t2 = System.nanoTime();
 			double van = (t1 - t0) / 1e6 / chunks, nat = (t2 - t1) / 1e6 / chunks;
 			System.out.printf("[rustgen] overworld noise fill per chunk: vanilla %.2f ms, native %.2f ms (%.2fx)%n", van, nat, van / nat);

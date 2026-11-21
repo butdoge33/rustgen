@@ -333,6 +333,29 @@ pub struct ChunkOut<'a> {
     pub density: &'a mut [f64],
     /// Router roots evaluated per block like OreVeinifier does (vein_toggle, vein_ridged, vein_gap).
     pub extra: Vec<(u32, &'a mut [f64])>,
+    /// If true, `extra` must be exactly [vein_toggle, vein_ridged, vein_gap] and values are
+    /// only computed where vanilla's OreVeinifier can read them (see [`vein_needs`]);
+    /// everything else is NaN.
+    pub lazy_veins: bool,
+}
+
+/// Vanilla OreVeinifier.VeinType bands: IRON -60..=-8 (toggle <= 0), COPPER 0..=50 (toggle > 0).
+const VEIN_BAND: (i32, i32) = (-60, 50);
+
+/// Whether OreVeinifier can read vein_ridged / vein_gap at `y` given the toggle value.
+/// Deliberately conservative (threshold 0.39 instead of 0.4F): computing extra values
+/// is harmless, missing one would not be.
+#[inline]
+fn vein_needs(toggle: f64, y: i32) -> bool {
+    let (min_y, max_y) = if toggle > 0.0 { (0, 50) } else { (-60, -8) };
+    let (j, k) = (max_y - y, y - min_y);
+    if j < 0 || k < 0 {
+        return false;
+    }
+    let l = j.min(k) as f64;
+    // Mth.clampedMap(l, 0, 20, -0.2, 0)
+    let f = clamped_lerp(-0.2, 0.0, l / 20.0);
+    toggle.abs() + f >= 0.39
 }
 
 /// Point used by TerrainShaper splines (continents, erosion, ridges, weirdness).
@@ -837,6 +860,10 @@ impl Program {
 
         let min_y = p.cell_noise_min_y * h;
         let mut corners = vec![[0.0f64; 8]; interps.len()];
+        let lazy_veins = out.lazy_veins;
+        if lazy_veins && out.extra.len() != 3 {
+            return Err("lazy_veins requires exactly [vein_toggle, vein_ridged, vein_gap]".into());
+        }
         let mut extra = out.extra;
         let density = out.density;
 
@@ -874,8 +901,22 @@ impl Program {
                                 density[idx] = self.ev(final_root, x, y, z, Mode::Block(&cell)) + beard;
 
                                 let blk = BlockCtx { lerp3: false, ..cell };
-                                for (r, o) in extra.iter_mut() {
-                                    o[idx] = self.ev(*r, x, y, z, Mode::Block(&blk));
+                                if lazy_veins {
+                                    let (t, rest) = extra.split_at_mut(1);
+                                    let toggle = if y >= VEIN_BAND.0 && y <= VEIN_BAND.1 {
+                                        self.ev(t[0].0, x, y, z, Mode::Block(&blk))
+                                    } else {
+                                        f64::NAN // outside both bands OreVeinifier ignores the toggle value
+                                    };
+                                    t[0].1[idx] = toggle;
+                                    let needed = !toggle.is_nan() && vein_needs(toggle, y);
+                                    for (r, o) in rest.iter_mut() {
+                                        o[idx] = if needed { self.ev(*r, x, y, z, Mode::Block(&blk)) } else { f64::NAN };
+                                    }
+                                } else {
+                                    for (r, o) in extra.iter_mut() {
+                                        o[idx] = self.ev(*r, x, y, z, Mode::Block(&blk));
+                                    }
                                 }
                             }
                         }

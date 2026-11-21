@@ -48,12 +48,15 @@ public final class NativeDensity implements AutoCloseable {
 	 * @param densityOut cacheAllInCell(add(finalDensity, beardifier)) per block
 	 * @param extraRoots roots evaluated per block like OreVeinifier does
 	 * @param extraOut   one array per extra root
+	 * @param lazyVeins  extraRoots are exactly {vein_toggle, vein_ridged, vein_gap}; only values
+	 *                   OreVeinifier can read are computed, the rest are NaN
 	 */
-	public void fillChunk(int finalRoot, int[] params, double[] beardifier, double[] densityOut, int[] extraRoots, double[][] extraOut) {
+	public void fillChunk(int finalRoot, int[] params, double[] beardifier, double[] densityOut, int[] extraRoots, double[][] extraOut,
+			boolean lazyVeins) {
 		lock.readLock().lock();
 		try {
 			if (handle == 0) throw new IllegalStateException("NativeDensity already closed");
-			fillChunk(handle, finalRoot, extraRoots, params, beardifier, densityOut, extraOut);
+			fillChunk(handle, finalRoot, extraRoots, params, beardifier, densityOut, extraOut, lazyVeins);
 		} finally {
 			lock.readLock().unlock();
 		}
@@ -81,5 +84,5 @@ public final class NativeDensity implements AutoCloseable {
 	private static native String checkChunk(long handle, int root);
 
 	private static native void fillChunk(long handle, int finalRoot, int[] extraRoots, int[] params,
-			double[] beardifier, double[] densityOut, Object[] extraOut);
+			double[] beardifier, double[] densityOut, Object[] extraOut, boolean lazyVeins);
 }
