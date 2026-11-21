@@ -4,13 +4,14 @@
 //! so a bug here surfaces as a normal Java stack trace instead of a JVM crash.
 
 pub mod blended;
+pub mod density;
 pub mod noise;
 pub mod perlin;
 pub mod random;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use jni::objects::{JClass, JDoubleArray, JIntArray, JLongArray, JString};
+use jni::objects::{JByteArray, JClass, JDoubleArray, JIntArray, JLongArray, JString};
 use jni::sys::{jboolean, jdouble, jint, jlong};
 use jni::JNIEnv;
 
@@ -20,7 +21,7 @@ use perlin::{NormalNoise, PerlinNoise};
 use random::Xoroshiro;
 
 /// Must match NativeLib.EXPECTED_ABI. Bump on any JNI signature change.
-pub const ABI_VERSION: jint = 2;
+pub const ABI_VERSION: jint = 3;
 
 /// Runs `f`, converting both JNI errors and panics into Java exceptions.
 fn guard<R: Default>(env: &mut JNIEnv, f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<R>) -> R {
@@ -233,5 +234,53 @@ pub extern "system" fn Java_rustgen_NativeNoise_blendedNoise(
         let noise = BlendedNoise::new(&mut rng, settings, cell_width, cell_height);
         eval_points(env, &pts, &out, |x, y, z| noise.compute(x, y, z))?;
         Ok(noise.max_value())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Density programs (see density.rs). Java side: rustgen.NativeDensity
+// ---------------------------------------------------------------------------
+
+/// Parses a program and returns an owning handle (never 0 on success).
+#[no_mangle]
+pub extern "system" fn Java_rustgen_NativeDensity_create(mut env: JNIEnv, _cls: JClass, bytes: JByteArray) -> jlong {
+    guard(&mut env, |env| {
+        let buf = env.convert_byte_array(&bytes)?;
+        match density::parse(&buf) {
+            Ok(p) => Ok(Box::into_raw(Box::new(p)) as jlong),
+            Err(msg) => {
+                env.throw_new("java/lang/IllegalArgumentException", format!("rustgen: invalid density program: {msg}"))?;
+                Ok(0)
+            }
+        }
+    })
+}
+
+/// Frees a handle from `create`. Java guarantees it is called at most once.
+#[no_mangle]
+pub extern "system" fn Java_rustgen_NativeDensity_free(_env: JNIEnv, _cls: JClass, handle: jlong) {
+    if handle != 0 {
+        // SAFETY: handle came from Box::into_raw in `create` and is freed exactly once.
+        drop(unsafe { Box::from_raw(handle as *mut density::Program) });
+    }
+}
+
+/// Evaluates root `root` at each packed block position. Thread-safe: programs are immutable.
+#[no_mangle]
+pub extern "system" fn Java_rustgen_NativeDensity_evalPoints(
+    mut env: JNIEnv, _cls: JClass, handle: jlong, root: jint, blocks: JIntArray, out: JDoubleArray,
+) {
+    guard(&mut env, |env| {
+        assert!(handle != 0, "null program handle");
+        // SAFETY: Java keeps the handle alive (not freed) for the duration of this call.
+        let program = unsafe { &*(handle as *const density::Program) };
+        let node = program
+            .root(root as usize)
+            .unwrap_or_else(|| panic!("root {root} is unsupported or out of range (count {})", program.root_count()));
+        let pts = read_ints(env, &blocks)?;
+        let n = env.get_array_length(&out)? as usize;
+        assert_eq!(pts.len(), n * 3, "blocks.length must be 3 * out.length");
+        let buf: Vec<f64> = pts.chunks_exact(3).map(|c| program.eval(node, c[0], c[1], c[2])).collect();
+        env.set_double_array_region(&out, 0, &buf)
     })
 }

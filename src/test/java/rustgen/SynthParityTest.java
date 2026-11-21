@@ -50,9 +50,7 @@ class SynthParityTest {
 
 	@BeforeAll
 	static void requireNative() {
-		// NormalNoise/BlendedNoise codecs touch registries, which need the game bootstrapped.
-		net.minecraft.SharedConstants.tryDetectVersion();
-		net.minecraft.server.Bootstrap.bootStrap();
+		TestSupport.bootstrap();
 		assertTrue(NativeLib.isAvailable(), "native library failed to load for " + NativeLib.platform());
 	}
 

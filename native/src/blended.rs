@@ -67,6 +67,16 @@ impl BlendedNoise {
         }
     }
 
+    /// Rebuilds an already-seeded vanilla BlendedNoise from its fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        min_limit: PerlinNoise, max_limit: PerlinNoise, main: PerlinNoise,
+        xz_scale: f64, y_scale: f64, xz_main_scale: f64, y_main_scale: f64,
+        cell_width: i32, cell_height: i32, max_value: f64,
+    ) -> Self {
+        Self { min_limit, max_limit, main, xz_scale, y_scale, xz_main_scale, y_main_scale, cell_width, cell_height, max_value }
+    }
+
     pub fn max_value(&self) -> f64 {
         self.max_value
     }

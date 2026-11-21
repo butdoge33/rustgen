@@ -78,6 +78,11 @@ impl ImprovedNoise {
         Self { p, xo, yo, zo }
     }
 
+    /// Rebuilds an already-seeded vanilla ImprovedNoise from its fields.
+    pub fn from_parts(p: [u8; 256], xo: f64, yo: f64, zo: f64) -> Self {
+        Self { p, xo, yo, zo }
+    }
+
     #[inline]
     fn perm(&self, i: i32) -> i32 {
         self.p[(i & 0xFF) as usize] as i32

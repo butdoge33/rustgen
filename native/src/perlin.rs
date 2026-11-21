@@ -20,7 +20,6 @@ pub fn wrap(d: f64) -> f64 {
 #[derive(Clone)]
 pub struct PerlinNoise {
     noise_levels: Vec<Option<ImprovedNoise>>,
-    first_octave: i32,
     amplitudes: Vec<f64>,
     lowest_freq_value_factor: f64,
     lowest_freq_input_factor: f64,
@@ -42,6 +41,18 @@ impl PerlinNoise {
             })
             .collect();
         Self::finish(noise_levels, first_octave, amplitudes)
+    }
+
+    /// Rebuilds an already-seeded vanilla PerlinNoise from its fields.
+    pub fn from_parts(
+        noise_levels: Vec<Option<ImprovedNoise>>,
+        amplitudes: Vec<f64>,
+        lowest_freq_input_factor: f64,
+        lowest_freq_value_factor: f64,
+        max_value: f64,
+    ) -> Self {
+        assert_eq!(noise_levels.len(), amplitudes.len(), "octave/amplitude count mismatch");
+        Self { noise_levels, amplitudes, lowest_freq_value_factor, lowest_freq_input_factor, max_value }
     }
 
     /// The legacy path (`useNewFactory == false`): octaves are drawn sequentially
@@ -94,7 +105,6 @@ impl PerlinNoise {
         let lowest_freq_value_factor = 2.0f64.powi(i - 1) / (2.0f64.powi(i) - 1.0);
         let mut p = Self {
             noise_levels,
-            first_octave,
             amplitudes,
             lowest_freq_value_factor,
             lowest_freq_input_factor,
@@ -102,10 +112,6 @@ impl PerlinNoise {
         };
         p.max_value = p.edge_value(2.0);
         p
-    }
-
-    pub fn first_octave(&self) -> i32 {
-        self.first_octave
     }
 
     pub fn max_value(&self) -> f64 {
@@ -176,6 +182,11 @@ impl NormalNoise {
         let first = PerlinNoise::new_legacy(random, first_octave, amplitudes.clone());
         let second = PerlinNoise::new_legacy(random, first_octave, amplitudes.clone());
         Self::finish(first, second, &amplitudes)
+    }
+
+    /// Rebuilds an already-seeded vanilla NormalNoise from its fields.
+    pub fn from_parts(value_factor: f64, first: PerlinNoise, second: PerlinNoise, max_value: f64) -> Self {
+        Self { value_factor, first, second, max_value }
     }
 
     fn finish(first: PerlinNoise, second: PerlinNoise, amplitudes: &[f64]) -> Self {

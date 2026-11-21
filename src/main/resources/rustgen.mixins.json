@@ -2,7 +2,12 @@
 	"required": true,
 	"package": "rustgen.mixin",
 	"compatibilityLevel": "JAVA_17",
-	"mixins": [],
+	"mixins": [
+		"BlendedNoiseAccessor",
+		"ImprovedNoiseAccessor",
+		"NormalNoiseAccessor",
+		"PerlinNoiseAccessor"
+	],
 	"injectors": {
 		"defaultRequire": 1
 	}
