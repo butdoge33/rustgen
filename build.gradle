@@ -1,0 +1,76 @@
+plugins {
+	id 'net.fabricmc.fabric-loom-remap' version "${loom_version}"
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings loom.officialMojangMappings()
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	testImplementation platform("org.junit:junit-bom:5.11.4")
+	testImplementation "org.junit.jupiter:junit-jupiter"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+// ---------------------------------------------------------------------------
+// Native (Rust) library
+// Builds native/ with cargo and packages it at /natives/<platform>/<file>
+// inside the mod jar. NativeLib.java extracts and loads it at runtime.
+// For now only the host platform is built; cross-builds come later.
+// ---------------------------------------------------------------------------
+def osName = System.getProperty("os.name").toLowerCase(Locale.ROOT)
+def osArch = System.getProperty("os.arch").toLowerCase(Locale.ROOT)
+def nativeOs = osName.contains("win") ? "windows" : (osName.contains("mac") ? "macos" : "linux")
+def nativeArch = (osArch == "amd64" || osArch == "x86_64") ? "x86_64" : osArch
+def nativeFile = nativeOs == "windows" ? "rustgen.dll" : (nativeOs == "macos" ? "librustgen.dylib" : "librustgen.so")
+def nativeOutDir = layout.buildDirectory.dir("generated/natives")
+
+def cargoBuild = tasks.register("cargoBuild", Exec) {
+	group = "build"
+	description = "Builds the Rust native library (release)."
+	workingDir = file("native")
+	commandLine "cargo", "build", "--release"
+	inputs.dir("native/src")
+	inputs.file("native/Cargo.toml")
+	outputs.file("native/target/release/${nativeFile}")
+}
+
+def copyNatives = tasks.register("copyNatives", Copy) {
+	dependsOn cargoBuild
+	into(nativeOutDir)
+	from("native/target/release/${nativeFile}") {
+		into("natives/${nativeOs}-${nativeArch}")
+	}
+}
+
+// Passing the task (not just the dir) makes every consumer of main resources
+// (processResources, sourcesJar, ...) depend on copyNatives automatically.
+sourceSets.main.resources.srcDir(copyNatives)
+
+processResources {
+	def version = project.version
+	inputs.property "version", version
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+test {
+	useJUnitPlatform()
+	testLogging {
+		events "passed", "failed", "skipped"
+		exceptionFormat "full"
+		showStandardStreams = true
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 17
+}
+
+java {
+	withSourcesJar()
+	sourceCompatibility = JavaVersion.VERSION_17
+	targetCompatibility = JavaVersion.VERSION_17
+}

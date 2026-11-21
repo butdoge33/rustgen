@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"id": "rustgen",
+	"version": "${version}",
+	"name": "RustGen",
+	"description": "Native (Rust) implementation of world generation hot paths, with vanilla fallback.",
+	"authors": [],
+	"icon": "assets/rustgen/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"rustgen.RustGenMod"
+		]
+	},
+	"mixins": [
+		"rustgen.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.14.0",
+		"minecraft": "~1.18.2",
+		"java": ">=17"
+	}
+}
