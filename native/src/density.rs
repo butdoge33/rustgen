@@ -194,6 +194,145 @@ pub struct Program {
     splines: Vec<Spline>,
     nodes: Vec<Node>,
     roots: Vec<Option<u32>>,
+    /// Per node: may the value depend on block y (in chunk mode)? Conservative.
+    y_dep: Vec<bool>,
+}
+
+/// Marker kinds, in the order DensityTranslator.MARKERS writes them.
+pub const MARK_INTERPOLATED: u8 = 0;
+pub const MARK_FLAT_CACHE: u8 = 1;
+pub const MARK_CACHE_2D: u8 = 2;
+pub const MARK_CACHE_ONCE: u8 = 3;
+pub const MARK_CACHE_ALL_IN_CELL: u8 = 4;
+
+/// Evaluation mode, mirroring which context vanilla code would be using.
+#[derive(Clone, Copy)]
+enum Mode<'a> {
+    /// SinglePointContext: every marker is pass-through (also used inside flat caches,
+    /// where positions are already quart-aligned with y = 0, making nested flat caches identity).
+    Point,
+    /// NoiseChunk while filling interpolator slices (corner positions).
+    Corner(&'a Memo),
+    /// NoiseChunk at a block inside the current cell.
+    Block(&'a BlockCtx<'a>),
+}
+
+impl<'a> Mode<'a> {
+    /// The chunk memo (chunk modes only).
+    #[inline]
+    fn memo(&self) -> &'a Memo {
+        match *self {
+            Mode::Corner(m) => m,
+            Mode::Block(b) => b.memo,
+            Mode::Point => unreachable!("no memo in point mode"),
+        }
+    }
+}
+
+/// Per-chunk caches mirroring NoiseChunk's FlatCache / Cache2D / CacheOnce. They only
+/// avoid recomputation: check_chunk guarantees the cached values equal a fresh evaluation.
+struct Memo {
+    /// node index -> slot in the column grids (flat_cache and cache_2d nodes)
+    col_slot: Vec<u32>,
+    /// node index -> slot for cache_once
+    once_slot: Vec<u32>,
+    min_x: i32,
+    min_z: i32,
+    /// grid side: chunk width + 1 (covers every column a chunk fill can touch)
+    side: usize,
+    col_val: Vec<std::cell::Cell<f64>>,
+    col_set: Vec<std::cell::Cell<bool>>,
+    once_val: Vec<std::cell::Cell<f64>>,
+    once_stamp: Vec<std::cell::Cell<u64>>,
+    /// Bumped for every new evaluation position (one per corner).
+    stamp: std::cell::Cell<u64>,
+}
+
+impl Memo {
+    /// Column-grid cell for (node, x, z), or None if the column is outside the chunk grid.
+    #[inline]
+    fn col(&self, node: u32, x: i32, z: i32) -> Option<usize> {
+        let slot = self.col_slot[node as usize];
+        let (ox, oz) = (x - self.min_x, z - self.min_z);
+        if slot == u32::MAX || ox < 0 || oz < 0 || ox as usize >= self.side || oz as usize >= self.side {
+            return None;
+        }
+        Some((slot as usize * self.side + ox as usize) * self.side + oz as usize)
+    }
+}
+
+struct BlockCtx<'a> {
+    memo: &'a Memo,
+    /// node index -> interpolator slot
+    slot_of: &'a [u32],
+    /// per slot, current cell corners in Mth.lerp3 argument order:
+    /// n000, n100, n010, n110, n001, n101, n011, n111
+    corners: &'a [[f64; 8]],
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    /// true: NoiseInterpolator while `fillingCell` (Mth.lerp3, x→y→z);
+    /// false: the updateForY/X/Z path (y→x→z), used outside cell caches.
+    lerp3: bool,
+}
+
+impl BlockCtx<'_> {
+    #[inline]
+    fn interpolate(&self, node: u32) -> f64 {
+        let c = &self.corners[self.slot_of[node as usize] as usize];
+        if self.lerp3 {
+            crate::noise::lerp3(self.dx, self.dy, self.dz, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7])
+        } else {
+            let xz00 = lerp(self.dy, c[0], c[2]);
+            let xz10 = lerp(self.dy, c[1], c[3]);
+            let xz01 = lerp(self.dy, c[4], c[6]);
+            let xz11 = lerp(self.dy, c[5], c[7]);
+            let z0 = lerp(self.dx, xz00, xz10);
+            let z1 = lerp(self.dx, xz01, xz11);
+            lerp(self.dz, z0, z1)
+        }
+    }
+}
+
+/// Chunk geometry, as NoiseChunk.forChunk computes it.
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkParams {
+    pub min_block_x: i32,
+    pub min_block_z: i32,
+    pub cell_noise_min_y: i32,
+    pub cell_count_y: i32,
+    pub cell_count_xz: i32,
+    pub cell_width: i32,
+    pub cell_height: i32,
+}
+
+impl ChunkParams {
+    pub fn width(&self) -> usize {
+        (self.cell_count_xz * self.cell_width) as usize
+    }
+    pub fn height(&self) -> usize {
+        (self.cell_count_y * self.cell_height) as usize
+    }
+    /// Blocks covered; output arrays must have exactly this length.
+    pub fn volume(&self) -> usize {
+        self.width() * self.width() * self.height()
+    }
+    fn validate(&self) -> Result<(), String> {
+        let ok = self.cell_width > 0 && self.cell_width <= 16 && self.cell_height > 0 && self.cell_height <= 16
+            && self.cell_count_xz > 0 && self.cell_count_xz * self.cell_width <= 64
+            && self.cell_count_y > 0 && self.cell_count_y <= 4096
+            && self.min_block_x.rem_euclid(self.cell_width) == 0 && self.min_block_z.rem_euclid(self.cell_width) == 0;
+        if ok { Ok(()) } else { Err(format!("invalid chunk params {self:?}")) }
+    }
+}
+
+/// Outputs of [`Program::fill_chunk`]; each slice has length `ChunkParams::volume()`,
+/// indexed `((y - minY) * width + (z - minZ)) * width + (x - minX)`.
+pub struct ChunkOut<'a> {
+    /// cacheAllInCell(add(finalDensity, beardifier)) — what NoiseChunk feeds the aquifer.
+    pub density: &'a mut [f64],
+    /// Router roots evaluated per block like OreVeinifier does (vein_toggle, vein_ridged, vein_gap).
+    pub extra: Vec<(u32, &'a mut [f64])>,
 }
 
 /// Point used by TerrainShaper splines (continents, erosion, ridges, weirdness).
@@ -216,26 +355,30 @@ impl Program {
 
     /// DensityFunction.compute(SinglePointContext(x, y, z))
     pub fn eval(&self, n: u32, x: i32, y: i32, z: i32) -> f64 {
+        self.ev(n, x, y, z, Mode::Point)
+    }
+
+    fn ev(&self, n: u32, x: i32, y: i32, z: i32, mode: Mode) -> f64 {
         let node = &self.nodes[n as usize];
         match node.op {
             Op::Constant(v) => v,
-            Op::Add(a, b) => self.eval(a, x, y, z) + self.eval(b, x, y, z),
+            Op::Add(a, b) => self.ev(a, x, y, z, mode) + self.ev(b, x, y, z, mode),
             Op::Mul(a, b) => {
-                let d = self.eval(a, x, y, z);
-                if d == 0.0 { 0.0 } else { d * self.eval(b, x, y, z) }
+                let d = self.ev(a, x, y, z, mode);
+                if d == 0.0 { 0.0 } else { d * self.ev(b, x, y, z, mode) }
             }
             Op::Min(a, b) => {
-                let d = self.eval(a, x, y, z);
-                if d < self.nodes[b as usize].min { d } else { java_min(d, self.eval(b, x, y, z)) }
+                let d = self.ev(a, x, y, z, mode);
+                if d < self.nodes[b as usize].min { d } else { java_min(d, self.ev(b, x, y, z, mode)) }
             }
             Op::Max(a, b) => {
-                let d = self.eval(a, x, y, z);
-                if d > self.nodes[b as usize].max { d } else { java_max(d, self.eval(b, x, y, z)) }
+                let d = self.ev(a, x, y, z, mode);
+                if d > self.nodes[b as usize].max { d } else { java_max(d, self.ev(b, x, y, z, mode)) }
             }
-            Op::AddConst(i, c) => self.eval(i, x, y, z) + c,
-            Op::MulConst(i, c) => self.eval(i, x, y, z) * c,
+            Op::AddConst(i, c) => self.ev(i, x, y, z, mode) + c,
+            Op::MulConst(i, c) => self.ev(i, x, y, z, mode) * c,
             Op::Mapped(kind, i) => {
-                let d = self.eval(i, x, y, z);
+                let d = self.ev(i, x, y, z, mode);
                 match kind {
                     MapKind::Abs => d.abs(),
                     MapKind::Square => d * d,
@@ -248,8 +391,41 @@ impl Program {
                     }
                 }
             }
-            Op::Clamp(i, lo, hi) => clamp(self.eval(i, x, y, z), lo, hi),
-            Op::Marker(_, i) => self.eval(i, x, y, z),
+            Op::Clamp(i, lo, hi) => clamp(self.ev(i, x, y, z, mode), lo, hi),
+            Op::Marker(kind, i) => match (kind, mode) {
+                (MARK_INTERPOLATED, Mode::Block(b)) => b.interpolate(n),
+                (MARK_INTERPOLATED, Mode::Corner(_)) => unreachable!("nested interpolation rejected by check_chunk"),
+                // NoiseChunk.FlatCache: value precomputed at the quart-aligned column, y = 0.
+                (MARK_FLAT_CACHE, Mode::Block(_) | Mode::Corner(_)) => {
+                    let memo = mode.memo();
+                    let (qx, qz) = ((x >> 2) << 2, (z >> 2) << 2);
+                    match memo.col(n, qx, qz) {
+                        Some(c) => self.memo_col(memo, c, || self.ev(i, qx, 0, qz, Mode::Point)),
+                        // Outside the cached grid vanilla evaluates at the real position.
+                        None => self.ev(i, x, y, z, mode),
+                    }
+                }
+                // NoiseChunk.Cache2D: per column (check_chunk guarantees y-independence).
+                (MARK_CACHE_2D, Mode::Block(_) | Mode::Corner(_)) => match mode.memo().col(n, x, z) {
+                    Some(c) => self.memo_col(mode.memo(), c, || self.ev(i, x, y, z, mode)),
+                    None => self.ev(i, x, y, z, mode),
+                },
+                // NoiseChunk.CacheOnce: per evaluation position (only reachable in corner mode).
+                (MARK_CACHE_ONCE, Mode::Corner(memo)) => {
+                    let slot = memo.once_slot[n as usize] as usize;
+                    let now = memo.stamp.get();
+                    if memo.once_stamp[slot].get() == now {
+                        memo.once_val[slot].get()
+                    } else {
+                        let v = self.ev(i, x, y, z, mode);
+                        memo.once_val[slot].set(v);
+                        memo.once_stamp[slot].set(now);
+                        v
+                    }
+                }
+                // point mode, or cache markers whose value is position-pure here.
+                _ => self.ev(i, x, y, z, mode),
+            },
             Op::Noise(noise, xz, ys) => match noise {
                 None => 0.0,
                 Some(k) => self.noises[k as usize].get_value(x as f64 * xz, y as f64 * ys, z as f64 * xz),
@@ -260,22 +436,22 @@ impl Program {
             Op::ShiftedNoise { sx, sy, sz, xz_scale, y_scale, noise } => match noise {
                 None => 0.0,
                 Some(k) => {
-                    let d = x as f64 * xz_scale + self.eval(sx, x, y, z);
-                    let e = y as f64 * y_scale + self.eval(sy, x, y, z);
-                    let f = z as f64 * xz_scale + self.eval(sz, x, y, z);
+                    let d = x as f64 * xz_scale + self.ev(sx, x, y, z, mode);
+                    let e = y as f64 * y_scale + self.ev(sy, x, y, z, mode);
+                    let f = z as f64 * xz_scale + self.ev(sz, x, y, z, mode);
                     self.noises[k as usize].get_value(d, e, f)
                 }
             },
             Op::RangeChoice { input, min_inclusive, max_exclusive, in_range, out_of_range } => {
-                let d = self.eval(input, x, y, z);
+                let d = self.ev(input, x, y, z, mode);
                 if d >= min_inclusive && d < max_exclusive {
-                    self.eval(in_range, x, y, z)
+                    self.ev(in_range, x, y, z, mode)
                 } else {
-                    self.eval(out_of_range, x, y, z)
+                    self.ev(out_of_range, x, y, z, mode)
                 }
             }
             Op::Slide(i, settings) => {
-                let d = self.eval(i, x, y, z);
+                let d = self.ev(i, x, y, z, mode);
                 match settings {
                     None => d,
                     Some(s) => {
@@ -287,16 +463,16 @@ impl Program {
                 }
             }
             Op::Spline { spline, min, max } => {
-                clamp(self.spline_apply(spline, None, x, y, z) as f64, min, max)
+                clamp(self.spline_apply(spline, None, x, y, z, mode) as f64, min, max)
             }
             Op::TerrainShaperSpline { c, e, w, spline, add_offset, min, max } => match spline {
                 None => 0.0,
                 Some(s) => {
-                    let c = self.eval(c, x, y, z) as f32;
-                    let e = self.eval(e, x, y, z) as f32;
-                    let w = self.eval(w, x, y, z) as f32;
+                    let c = self.ev(c, x, y, z, mode) as f32;
+                    let e = self.ev(e, x, y, z, mode) as f32;
+                    let w = self.ev(w, x, y, z, mode) as f32;
                     let pt = ShaperPoint { c, e, r: peaks_and_valleys(w), w };
-                    let mut v = self.spline_apply(s, Some(&pt), x, y, z);
+                    let mut v = self.spline_apply(s, Some(&pt), x, y, z, mode);
                     if add_offset {
                         v += -0.50375f32; // TerrainShaper.GLOBAL_OFFSET
                     }
@@ -304,7 +480,7 @@ impl Program {
                 }
             },
             Op::WeirdScaled { input, noise, type2 } => {
-                let d = self.eval(input, x, y, z);
+                let d = self.ev(input, x, y, z, mode);
                 match noise {
                     None => 0.0,
                     Some(k) => {
@@ -320,12 +496,26 @@ impl Program {
             }
             Op::BlendAlpha => 1.0,
             Op::BlendOffset => 0.0,
-            Op::Beardifier => 0.0,
+            Op::Beardifier => match mode {
+                Mode::Point => 0.0,
+                _ => unreachable!("beardifier inside router rejected by check_chunk"),
+            },
             // Blender.empty().blendDensity(ctx, d) == d. Non-empty blending (next to
             // pre-1.18 chunks) is handled by falling back to vanilla.
-            Op::BlendDensity(i) => self.eval(i, x, y, z),
+            Op::BlendDensity(i) => self.ev(i, x, y, z, mode),
             Op::OldBlendedNoise(b) => self.blended[b as usize].compute(x, y, z),
         }
+    }
+
+    #[inline]
+    fn memo_col(&self, memo: &Memo, c: usize, compute: impl FnOnce() -> f64) -> f64 {
+        if memo.col_set[c].get() {
+            return memo.col_val[c].get();
+        }
+        let v = compute();
+        memo.col_val[c].set(v);
+        memo.col_set[c].set(true);
+        v
     }
 
     #[inline]
@@ -337,7 +527,7 @@ impl Program {
     }
 
     /// CubicSpline.apply — all arithmetic in f32, as in vanilla.
-    fn spline_apply(&self, s: u32, pt: Option<&ShaperPoint>, x: i32, y: i32, z: i32) -> f32 {
+    fn spline_apply(&self, s: u32, pt: Option<&ShaperPoint>, x: i32, y: i32, z: i32, mode: Mode) -> f32 {
         let (coord, locations, derivatives, values) = match &self.splines[s as usize] {
             Spline::Constant(v) => return *v,
             Spline::Multipoint { coord, locations, derivatives, values } => (coord, locations, derivatives, values),
@@ -348,7 +538,7 @@ impl Program {
             Coord::Erosion => shaper().e,
             Coord::Ridges => shaper().r,
             Coord::Weirdness => shaper().w,
-            Coord::Node(n) => self.eval(n, x, y, z) as f32,
+            Coord::Node(n) => self.ev(n, x, y, z, mode) as f32,
         };
 
         // Mth.binarySearch(0, len, ix -> f < locations[ix]) - 1
@@ -368,22 +558,332 @@ impl Program {
         let last = len - 1;
 
         if i < 0 {
-            return self.spline_apply(values[0], pt, x, y, z) + derivatives[0] * (f - locations[0]);
+            return self.spline_apply(values[0], pt, x, y, z, mode) + derivatives[0] * (f - locations[0]);
         }
         let i = i as usize;
         if i == last {
-            return self.spline_apply(values[last], pt, x, y, z) + derivatives[last] * (f - locations[last]);
+            return self.spline_apply(values[last], pt, x, y, z, mode) + derivatives[last] * (f - locations[last]);
         }
         let g = locations[i];
         let h = locations[i + 1];
         let t = (f - g) / (h - g);
         let l = derivatives[i];
         let m = derivatives[i + 1];
-        let n = self.spline_apply(values[i], pt, x, y, z);
-        let o = self.spline_apply(values[i + 1], pt, x, y, z);
+        let n = self.spline_apply(values[i], pt, x, y, z, mode);
+        let o = self.spline_apply(values[i + 1], pt, x, y, z, mode);
         let p = l * (h - g) - (o - n);
         let q = -m * (h - g) + (o - n);
         lerp_f(t, n, o) + t * (1.0f32 - t) * lerp_f(t, p, q)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chunk mode (NoiseChunk equivalent)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum CheckMode {
+    Point,
+    Corner,
+    Block,
+}
+
+impl Program {
+    fn compute_y_dep(&mut self) {
+        let mut dep = vec![false; self.nodes.len()];
+        for (i, node) in self.nodes.iter().enumerate() {
+            let d = |j: u32| dep[j as usize];
+            let spline_dep = |s: u32| self.spline_y_dep(s, &dep);
+            dep[i] = match node.op {
+                Op::Constant(_) | Op::BlendAlpha | Op::BlendOffset | Op::ShiftA(_) | Op::ShiftB(_) => false,
+                Op::Add(a, b) | Op::Mul(a, b) | Op::Min(a, b) | Op::Max(a, b) => d(a) || d(b),
+                Op::AddConst(c, _) | Op::MulConst(c, _) | Op::Mapped(_, c) | Op::Clamp(c, _, _) | Op::BlendDensity(c) => d(c),
+                Op::Marker(MARK_FLAT_CACHE, _) => false, // evaluated at y = 0 in chunk mode
+                Op::Marker(_, c) => d(c),
+                Op::Noise(_, _, ys) => ys != 0.0,
+                Op::Shift(_) => true,
+                Op::ShiftedNoise { sx, sy, sz, y_scale, .. } => y_scale != 0.0 || d(sx) || d(sy) || d(sz),
+                Op::RangeChoice { input, in_range, out_of_range, .. } => d(input) || d(in_range) || d(out_of_range),
+                Op::Slide(c, settings) => settings.is_some() || d(c),
+                Op::Spline { spline, .. } => spline_dep(spline),
+                Op::TerrainShaperSpline { c, e, w, .. } => d(c) || d(e) || d(w),
+                Op::WeirdScaled { .. } | Op::YClampedGradient { .. } | Op::Beardifier | Op::OldBlendedNoise(_) => true,
+            };
+        }
+        self.y_dep = dep;
+    }
+
+    fn spline_y_dep(&self, s: u32, dep: &[bool]) -> bool {
+        match &self.splines[s as usize] {
+            Spline::Constant(_) => false,
+            Spline::Multipoint { coord, values, .. } => {
+                matches!(coord, Coord::Node(n) if dep[*n as usize]) || values.iter().any(|&v| self.spline_y_dep(v, dep))
+            }
+        }
+    }
+
+    /// Checks that `root` can be evaluated in chunk mode with results identical to vanilla
+    /// NoiseChunk. Rejects constructs whose vanilla value depends on evaluation history:
+    /// nested interpolation, cache_all_in_cell inside the router, cache_once outside an
+    /// interpolator, y-dependent cache_2d, and beardifier markers inside the router.
+    pub fn check_chunk(&self, root: u32) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        self.check(root, CheckMode::Block, &mut seen)
+    }
+
+    fn check(&self, n: u32, mode: CheckMode, seen: &mut std::collections::HashSet<(u32, CheckMode)>) -> Result<(), String> {
+        if !seen.insert((n, mode)) {
+            return Ok(());
+        }
+        let node = &self.nodes[n as usize];
+        let mut kids: Vec<(u32, CheckMode)> = Vec::new();
+        match node.op {
+            Op::Marker(kind, c) => match kind {
+                MARK_INTERPOLATED => match mode {
+                    CheckMode::Block => kids.push((c, CheckMode::Corner)),
+                    CheckMode::Corner => return Err(format!("node {n}: nested interpolation")),
+                    CheckMode::Point => kids.push((c, CheckMode::Point)),
+                },
+                MARK_FLAT_CACHE => kids.push((c, CheckMode::Point)),
+                MARK_CACHE_2D => {
+                    if self.y_dep[c as usize] {
+                        return Err(format!("node {n}: cache_2d over a y-dependent function"));
+                    }
+                    kids.push((c, mode));
+                }
+                MARK_CACHE_ONCE => {
+                    if mode == CheckMode::Block {
+                        return Err(format!("node {n}: cache_once outside an interpolator"));
+                    }
+                    kids.push((c, mode));
+                }
+                MARK_CACHE_ALL_IN_CELL => {
+                    if mode != CheckMode::Point {
+                        return Err(format!("node {n}: cache_all_in_cell inside the router"));
+                    }
+                    kids.push((c, mode));
+                }
+                k => return Err(format!("node {n}: unknown marker kind {k}")),
+            },
+            Op::Beardifier if mode != CheckMode::Point => return Err(format!("node {n}: beardifier marker inside the router")),
+            Op::Spline { spline, .. } => {
+                let mut stack = vec![spline];
+                while let Some(s) = stack.pop() {
+                    if let Spline::Multipoint { coord, values, .. } = &self.splines[s as usize] {
+                        if let Coord::Node(c) = coord {
+                            kids.push((*c, mode));
+                        }
+                        stack.extend(values.iter().copied());
+                    }
+                }
+            }
+            _ => self.for_each_child(n, |c| kids.push((c, mode))),
+        }
+        for (c, m) in kids {
+            self.check(c, m, seen)?;
+        }
+        Ok(())
+    }
+
+    fn for_each_child(&self, n: u32, mut f: impl FnMut(u32)) {
+        match self.nodes[n as usize].op {
+            Op::Add(a, b) | Op::Mul(a, b) | Op::Min(a, b) | Op::Max(a, b) => {
+                f(a);
+                f(b)
+            }
+            Op::AddConst(c, _) | Op::MulConst(c, _) | Op::Mapped(_, c) | Op::Clamp(c, _, _) | Op::Marker(_, c)
+            | Op::Slide(c, _) | Op::BlendDensity(c) | Op::WeirdScaled { input: c, .. } => f(c),
+            Op::ShiftedNoise { sx, sy, sz, .. } => {
+                f(sx);
+                f(sy);
+                f(sz)
+            }
+            Op::RangeChoice { input, in_range, out_of_range, .. } => {
+                f(input);
+                f(in_range);
+                f(out_of_range)
+            }
+            Op::TerrainShaperSpline { c, e, w, .. } => {
+                f(c);
+                f(e);
+                f(w)
+            }
+            Op::Spline { .. } // handled by caller (spline coordinates)
+            | Op::Constant(_) | Op::Noise(..) | Op::ShiftA(_) | Op::ShiftB(_) | Op::Shift(_)
+            | Op::YClampedGradient { .. } | Op::BlendAlpha | Op::BlendOffset | Op::Beardifier
+            | Op::OldBlendedNoise(_) => {}
+        }
+    }
+
+    /// Interpolated markers reachable from `root` in Block mode (the ones NoiseChunk
+    /// turns into NoiseInterpolators that this root reads).
+    fn collect_interpolators(&self, root: u32, out: &mut Vec<u32>, seen: &mut std::collections::HashSet<u32>) {
+        if !seen.insert(root) {
+            return;
+        }
+        match self.nodes[root as usize].op {
+            Op::Marker(MARK_INTERPOLATED, _) => out.push(root),
+            Op::Marker(MARK_FLAT_CACHE, _) => {} // point-mode subtree
+            Op::Spline { spline, .. } => {
+                let mut stack = vec![spline];
+                while let Some(s) = stack.pop() {
+                    if let Spline::Multipoint { coord, values, .. } = &self.splines[s as usize] {
+                        if let Coord::Node(c) = coord {
+                            self.collect_interpolators(*c, out, seen);
+                        }
+                        stack.extend(values.iter().copied());
+                    }
+                }
+            }
+            _ => {
+                let mut kids = Vec::new();
+                self.for_each_child(root, |c| kids.push(c));
+                for c in kids {
+                    self.collect_interpolators(c, out, seen);
+                }
+            }
+        }
+    }
+
+    /// Equivalent of NoiseBasedChunkGenerator.doFill's noise sampling for one chunk with
+    /// Blender.empty(): fills `out.density` with the cell-cached final density (+ beardifier)
+    /// and each `out.extra` root with its per-block value, bit-identical to vanilla.
+    ///
+    /// `beardifier`: per-block values (same layout as outputs), or None for "no structures".
+    pub fn fill_chunk(&self, p: ChunkParams, final_root: u32, beardifier: Option<&[f64]>, out: ChunkOut) -> Result<(), String> {
+        p.validate()?;
+        let vol = p.volume();
+        if out.density.len() != vol || out.extra.iter().any(|(_, o)| o.len() != vol) || beardifier.is_some_and(|b| b.len() != vol) {
+            return Err(format!("array length mismatch: expected {vol}"));
+        }
+        self.check_chunk(final_root).map_err(|e| format!("final density: {e}"))?;
+        for (r, _) in &out.extra {
+            self.check_chunk(*r).map_err(|e| format!("root node {r}: {e}"))?;
+        }
+
+        // NoiseInterpolators: every Interpolated node reachable from any root.
+        let mut interps = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        self.collect_interpolators(final_root, &mut interps, &mut seen);
+        for (r, _) in &out.extra {
+            self.collect_interpolators(*r, &mut interps, &mut seen);
+        }
+        let mut slot_of = vec![u32::MAX; self.nodes.len()];
+        for (slot, &n) in interps.iter().enumerate() {
+            slot_of[n as usize] = slot as u32;
+        }
+
+        let (w, h) = (p.cell_width, p.cell_height);
+        let nxz = p.cell_count_xz as usize;
+        let ny = p.cell_count_y as usize;
+        let first_cell_x = p.min_block_x.div_euclid(w);
+        let first_cell_z = p.min_block_z.div_euclid(w);
+
+        // Per-chunk caches for every flat_cache / cache_2d / cache_once node.
+        let width = p.width();
+        let side = width + 1;
+        let mut col_slot = vec![u32::MAX; self.nodes.len()];
+        let mut once_slot = vec![u32::MAX; self.nodes.len()];
+        let (mut n_col, mut n_once) = (0u32, 0u32);
+        for (i, node) in self.nodes.iter().enumerate() {
+            match node.op {
+                Op::Marker(MARK_FLAT_CACHE | MARK_CACHE_2D, _) => {
+                    col_slot[i] = n_col;
+                    n_col += 1;
+                }
+                Op::Marker(MARK_CACHE_ONCE, _) => {
+                    once_slot[i] = n_once;
+                    n_once += 1;
+                }
+                _ => {}
+            }
+        }
+        let cells = n_col as usize * side * side;
+        let memo = Memo {
+            col_slot,
+            once_slot,
+            min_x: p.min_block_x,
+            min_z: p.min_block_z,
+            side,
+            col_val: (0..cells).map(|_| std::cell::Cell::new(0.0)).collect(),
+            col_set: (0..cells).map(|_| std::cell::Cell::new(false)).collect(),
+            once_val: (0..n_once).map(|_| std::cell::Cell::new(0.0)).collect(),
+            once_stamp: (0..n_once).map(|_| std::cell::Cell::new(u64::MAX)).collect(),
+            stamp: std::cell::Cell::new(0),
+        };
+
+        // Slice filling: each interpolator's wrapped function at every cell corner.
+        let gidx = |cx: usize, cz: usize, cy: usize| (cx * (nxz + 1) + cz) * (ny + 1) + cy;
+        let mut grids: Vec<Vec<f64>> = Vec::with_capacity(interps.len());
+        for &n in &interps {
+            let child = match self.nodes[n as usize].op {
+                Op::Marker(_, c) => c,
+                _ => unreachable!(),
+            };
+            let mut g = vec![0.0; (nxz + 1) * (nxz + 1) * (ny + 1)];
+            for cx in 0..=nxz {
+                let bx = (first_cell_x + cx as i32) * w;
+                for cz in 0..=nxz {
+                    let bz = (first_cell_z + cz as i32) * w;
+                    for cy in 0..=ny {
+                        let by = (cy as i32 + p.cell_noise_min_y) * h;
+                        memo.stamp.set(memo.stamp.get() + 1);
+                        g[gidx(cx, cz, cy)] = self.ev(child, bx, by, bz, Mode::Corner(&memo));
+                    }
+                }
+            }
+            grids.push(g);
+        }
+
+        let min_y = p.cell_noise_min_y * h;
+        let mut corners = vec![[0.0f64; 8]; interps.len()];
+        let mut extra = out.extra;
+        let density = out.density;
+
+        for cx in 0..nxz {
+            for cz in 0..nxz {
+                for cy in 0..ny {
+                    // NoiseInterpolator.selectCellYZ
+                    for (slot, g) in grids.iter().enumerate() {
+                        corners[slot] = [
+                            g[gidx(cx, cz, cy)],             // n000
+                            g[gidx(cx + 1, cz, cy)],         // n100
+                            g[gidx(cx, cz, cy + 1)],         // n010
+                            g[gidx(cx + 1, cz, cy + 1)],     // n110
+                            g[gidx(cx, cz + 1, cy)],         // n001
+                            g[gidx(cx + 1, cz + 1, cy)],     // n101
+                            g[gidx(cx, cz + 1, cy + 1)],     // n011
+                            g[gidx(cx + 1, cz + 1, cy + 1)], // n111
+                        ];
+                    }
+                    for ty in 0..h {
+                        let y = (p.cell_noise_min_y + cy as i32) * h + ty;
+                        let dy = ty as f64 / h as f64;
+                        for tx in 0..w {
+                            let x = (first_cell_x + cx as i32) * w + tx;
+                            let dx = tx as f64 / w as f64;
+                            for tz in 0..w {
+                                let z = (first_cell_z + cz as i32) * w + tz;
+                                let dz = tz as f64 / w as f64;
+                                let idx = ((y - min_y) as usize * width + (z - p.min_block_z) as usize) * width
+                                    + (x - p.min_block_x) as usize;
+
+                                let cell = BlockCtx { memo: &memo, slot_of: &slot_of, corners: &corners, dx, dy, dz, lerp3: true };
+                                let beard = beardifier.map_or(0.0, |b| b[idx]);
+                                // Ap2(ADD, finalDensity, beardifier): d + e, always (so -0.0 + 0.0 == 0.0 as in vanilla).
+                                density[idx] = self.ev(final_root, x, y, z, Mode::Block(&cell)) + beard;
+
+                                let blk = BlockCtx { lerp3: false, ..cell };
+                                for (r, o) in extra.iter_mut() {
+                                    o[idx] = self.ev(*r, x, y, z, Mode::Block(&blk));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -661,7 +1161,7 @@ impl<'a> Parser<'a> {
 pub fn parse(buf: &[u8]) -> R<Program> {
     let mut ps = Parser {
         r: Reader { buf, pos: 0 },
-        p: Program { noises: vec![], blended: vec![], splines: vec![], nodes: vec![], roots: vec![] },
+        p: Program { noises: vec![], blended: vec![], splines: vec![], nodes: vec![], roots: vec![], y_dep: vec![] },
     };
     if ps.r.u32()? != MAGIC {
         return Err("bad magic (not a rustgen density program)".into());
@@ -719,5 +1219,7 @@ pub fn parse(buf: &[u8]) -> R<Program> {
     if ps.r.pos != buf.len() {
         return Err(format!("{} trailing bytes after program", buf.len() - ps.r.pos));
     }
-    Ok(ps.p)
+    let mut p = ps.p;
+    p.compute_y_dep();
+    Ok(p)
 }

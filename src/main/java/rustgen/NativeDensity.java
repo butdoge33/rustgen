@@ -28,6 +28,37 @@ public final class NativeDensity implements AutoCloseable {
 		}
 	}
 
+	/** @return null if {@code root} can be chunk-filled natively, else the reason it can't */
+	public String checkChunk(int root) {
+		lock.readLock().lock();
+		try {
+			if (handle == 0) throw new IllegalStateException("NativeDensity already closed");
+			return checkChunk(handle, root);
+		} finally {
+			lock.readLock().unlock();
+		}
+	}
+
+	/**
+	 * Native equivalent of NoiseChunk sampling during doFill (Blender.empty()).
+	 * Arrays are indexed {@code ((y - minY) * width + (z - minZ)) * width + (x - minX)}.
+	 *
+	 * @param params     {minBlockX, minBlockZ, cellNoiseMinY, cellCountY, cellCountXZ, cellWidth, cellHeight}
+	 * @param beardifier per-block beardifier values, or null for none
+	 * @param densityOut cacheAllInCell(add(finalDensity, beardifier)) per block
+	 * @param extraRoots roots evaluated per block like OreVeinifier does
+	 * @param extraOut   one array per extra root
+	 */
+	public void fillChunk(int finalRoot, int[] params, double[] beardifier, double[] densityOut, int[] extraRoots, double[][] extraOut) {
+		lock.readLock().lock();
+		try {
+			if (handle == 0) throw new IllegalStateException("NativeDensity already closed");
+			fillChunk(handle, finalRoot, extraRoots, params, beardifier, densityOut, extraOut);
+		} finally {
+			lock.readLock().unlock();
+		}
+	}
+
 	@Override
 	public void close() {
 		lock.writeLock().lock();
@@ -46,4 +77,9 @@ public final class NativeDensity implements AutoCloseable {
 	private static native void free(long handle);
 
 	private static native void evalPoints(long handle, int root, int[] blocks, double[] out);
+
+	private static native String checkChunk(long handle, int root);
+
+	private static native void fillChunk(long handle, int finalRoot, int[] extraRoots, int[] params,
+			double[] beardifier, double[] densityOut, Object[] extraOut);
 }

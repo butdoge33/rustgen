@@ -11,7 +11,8 @@ pub mod random;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use jni::objects::{JByteArray, JClass, JDoubleArray, JIntArray, JLongArray, JString};
+use jni::objects::{JByteArray, JClass, JDoubleArray, JIntArray, JLongArray, JObjectArray, JString};
+use jni::sys::jstring;
 use jni::sys::{jboolean, jdouble, jint, jlong};
 use jni::JNIEnv;
 
@@ -21,7 +22,7 @@ use perlin::{NormalNoise, PerlinNoise};
 use random::Xoroshiro;
 
 /// Must match NativeLib.EXPECTED_ABI. Bump on any JNI signature change.
-pub const ABI_VERSION: jint = 3;
+pub const ABI_VERSION: jint = 4;
 
 /// Runs `f`, converting both JNI errors and panics into Java exceptions.
 fn guard<R: Default>(env: &mut JNIEnv, f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<R>) -> R {
@@ -282,5 +283,65 @@ pub extern "system" fn Java_rustgen_NativeDensity_evalPoints(
         assert_eq!(pts.len(), n * 3, "blocks.length must be 3 * out.length");
         let buf: Vec<f64> = pts.chunks_exact(3).map(|c| program.eval(node, c[0], c[1], c[2])).collect();
         env.set_double_array_region(&out, 0, &buf)
+    })
+}
+
+/// Returns null if `root` can be chunk-filled, otherwise the reason it can't.
+#[no_mangle]
+pub extern "system" fn Java_rustgen_NativeDensity_checkChunk(mut env: JNIEnv, _cls: JClass, handle: jlong, root: jint) -> jstring {
+    guard(&mut env, |env| {
+        assert!(handle != 0, "null program handle");
+        // SAFETY: see evalPoints.
+        let program = unsafe { &*(handle as *const density::Program) };
+        let result = match program.root(root as usize) {
+            None => Err(format!("root {root} is unsupported or out of range")),
+            Some(n) => program.check_chunk(n),
+        };
+        match result {
+            Ok(()) => Ok(std::ptr::null_mut()),
+            Err(msg) => Ok(env.new_string(msg)?.into_raw()),
+        }
+    })
+}
+
+/// See density::Program::fill_chunk. `extraRoots[i]` is written into `extraOut[i]`
+/// (an Object[] of double[]). `beardifier` may be null.
+#[no_mangle]
+pub extern "system" fn Java_rustgen_NativeDensity_fillChunk(
+    mut env: JNIEnv, _cls: JClass, handle: jlong, final_root: jint, extra_roots: JIntArray,
+    params: JIntArray, beardifier: JDoubleArray, density_out: JDoubleArray, extra_out: JObjectArray,
+) {
+    guard(&mut env, |env| {
+        assert!(handle != 0, "null program handle");
+        // SAFETY: see evalPoints.
+        let program = unsafe { &*(handle as *const density::Program) };
+        let root_node = |r: i32| program.root(r as usize).unwrap_or_else(|| panic!("root {r} is unsupported or out of range"));
+
+        let pr = read_ints(env, &params)?;
+        assert_eq!(pr.len(), 7, "params must be [minX, minZ, cellNoiseMinY, cellCountY, cellCountXZ, cellWidth, cellHeight]");
+        let p = density::ChunkParams {
+            min_block_x: pr[0], min_block_z: pr[1], cell_noise_min_y: pr[2], cell_count_y: pr[3],
+            cell_count_xz: pr[4], cell_width: pr[5], cell_height: pr[6],
+        };
+        let vol = p.volume();
+
+        let beard = if beardifier.is_null() { None } else { Some(read_doubles(env, &beardifier)?) };
+        let roots = read_ints(env, &extra_roots)?;
+        let n_extra = env.get_array_length(&extra_out)? as usize;
+        assert_eq!(roots.len(), n_extra, "extraRoots and extraOut lengths differ");
+
+        let mut density = vec![0.0; vol];
+        let mut extra_bufs: Vec<Vec<f64>> = (0..n_extra).map(|_| vec![0.0; vol]).collect();
+        let extra = roots.iter().map(|&r| root_node(r)).zip(extra_bufs.iter_mut().map(|v| v.as_mut_slice())).collect();
+        program
+            .fill_chunk(p, root_node(final_root), beard.as_deref(), density::ChunkOut { density: &mut density, extra })
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        env.set_double_array_region(&density_out, 0, &density)?;
+        for (i, buf) in extra_bufs.iter().enumerate() {
+            let arr: JDoubleArray = env.get_object_array_element(&extra_out, i as i32)?.into();
+            env.set_double_array_region(&arr, 0, buf)?;
+        }
+        Ok(())
     })
 }
