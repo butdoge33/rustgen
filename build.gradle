@@ -89,14 +89,14 @@ loom {
 			server()
 			configName = "Pregen (native)"
 			runDir = "run/pregen-native"
-			vmArgs "-Xmx2G", "-Drustgen.pregen=12"
+			vmArgs "-Xmx2G", "-Drustgen.pregen=12", "-Drustgen.hashFills=true"
 			programArgs "nogui"
 		}
 		pregenVanilla {
 			server()
 			configName = "Pregen (vanilla)"
 			runDir = "run/pregen-vanilla"
-			vmArgs "-Xmx2G", "-Drustgen.pregen=12", "-Drustgen.disable=true"
+			vmArgs "-Xmx2G", "-Drustgen.pregen=12", "-Drustgen.hashFills=true", "-Drustgen.disable=true"
 			programArgs "nogui"
 		}
 	}

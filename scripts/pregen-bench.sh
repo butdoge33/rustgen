@@ -29,15 +29,19 @@ done
 
 run_one() { # $1 = Native | Vanilla, $2 = pair index
   local mode=$1 i=$2 dir="run/pregen-${1,,}" log="$OUT/$1-$2.log"
-  rm -rf "$dir/world" "$dir/rustgen-pregen.txt"
-  timeout 1200 ./gradlew "runPregen$mode" --console=plain > "$log" 2>&1
+  rm -rf "$dir/world" "$dir/rustgen-pregen.txt" "$dir/rustgen-fills.txt"
+  timeout 600 ./gradlew "runPregen$mode" --console=plain > "$log" 2>&1
   # The server JVM is forked by the Gradle daemon, so a timeout doesn't stop it; make
   # sure no server is left holding the port (its command line carries -Drustgen.pregen=).
   local left
   left=$(pgrep -f -- '-Drustgen\.pregen=' || true)
   if [ -n "$left" ]; then
     # Still running after the timeout: record where it is stuck, then kill it.
-    for pid in $left; do jstack "$pid" > "$OUT/$mode-$i.jstack.txt" 2>&1 || true; done
+    for pid in $left; do
+      jstack "$pid" > "$OUT/$mode-$i.jstack.txt" 2>&1 || true
+      sleep 20
+      jstack "$pid" > "$OUT/$mode-$i.jstack2.txt" 2>&1 || true
+    done
     kill -9 $left 2>/dev/null
     echo "pair $i  $mode  (timed out; thread dump in $OUT/$mode-$i.jstack.txt)" | tee -a "$SUMMARY"
   fi
@@ -50,6 +54,15 @@ run_one() { # $1 = Native | Vanilla, $2 = pair index
 for i in $(seq 1 "$PAIRS"); do
   if (( i % 2 )); then order="Native Vanilla"; else order="Vanilla Native"; fi
   for m in $order; do run_one "$m" "$i"; done
+  # Every doFill output (spawn area included), compared by chunk position.
+  if [ -f run/pregen-native/rustgen-fills.txt ] && [ -f run/pregen-vanilla/rustgen-fills.txt ]; then
+    cp run/pregen-native/rustgen-fills.txt "$OUT/Native-$i.fills.txt"
+    cp run/pregen-vanilla/rustgen-fills.txt "$OUT/Vanilla-$i.fills.txt"
+    join <(awk '{print $1"_"$2, $3}' run/pregen-native/rustgen-fills.txt | sort) \
+         <(awk '{print $1"_"$2, $3}' run/pregen-vanilla/rustgen-fills.txt | sort) \
+      | awk -v i="$i" '{n++; if ($2 != $3) {d++; if (d <= 5) print "pair " i "  FILL DIFF at chunk " $1}} END {print "pair " i "  doFill hashes: " n " common chunks, " d+0 " differ"}' \
+      | tee -a "$SUMMARY"
+  fi
   if cmp -s run/pregen-native/rustgen-pregen.txt run/pregen-vanilla/rustgen-pregen.txt; then
     echo "pair $i  hashes IDENTICAL ($(wc -l < run/pregen-native/rustgen-pregen.txt) chunks)" | tee -a "$SUMMARY"
   else

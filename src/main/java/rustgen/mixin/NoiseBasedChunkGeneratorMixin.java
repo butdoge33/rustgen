@@ -20,6 +20,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import rustgen.NativeFill;
 import rustgen.NativeRouter;
 import rustgen.Stats;
+import rustgen.debug.FillHashes;
 
 /**
  * Replaces the noise sampling in doFill with the native fill when possible. If anything
@@ -45,6 +46,7 @@ public abstract class NoiseBasedChunkGeneratorMixin {
 		if (nr != null && NativeFill.fill(nr, router, settings.value(), globalFluidPicker, defaultBlock, blender, structures, chunk, cellNoiseMinY, cellCountY)) {
 			Stats.DOFILL_NANOS.add(System.nanoTime() - t0);
 			Stats.DOFILL_COUNT.increment();
+			FillHashes.record(chunk);
 			cir.setReturnValue(chunk);
 		} else {
 			rustgen$start.get()[0] = t0; // vanilla path; timed at RETURN
@@ -56,6 +58,7 @@ public abstract class NoiseBasedChunkGeneratorMixin {
 			CallbackInfoReturnable<ChunkAccess> cir) {
 		Stats.DOFILL_NANOS.add(System.nanoTime() - rustgen$start.get()[0]);
 		Stats.DOFILL_COUNT.increment();
+		FillHashes.record(chunk);
 	}
 
 	@Unique
