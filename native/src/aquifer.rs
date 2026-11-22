@@ -130,6 +130,12 @@ fn clamped_map(d: f64, e: f64, f: f64, g: f64, h: f64) -> f64 {
     clamped_lerp(g, h, (d - e) / (f - e))
 }
 
+/// The candidate aquifer centers of one grid key and their (lazily computed) statuses.
+struct CandidateSet {
+    pos: [(i32, i32, i32); 12],
+    status: [Option<FluidStatus>; 12],
+}
+
 /// Levels evaluated per batch in the preliminary-surface scan.
 const SCAN_GROUP: usize = 16;
 
@@ -153,12 +159,11 @@ pub(super) struct Aquifer<'a> {
     size_z: i32,
     location: Vec<Option<(i32, i32, i32)>>,
     status: Vec<Option<FluidStatus>>,
-    /// The 12 candidate aquifer centers of the last grid key (l, m, n), in vanilla's
-    /// iteration order. Consecutive blocks almost always share the key.
-    candidates_key: Option<(i32, i32, i32)>,
-    candidates: [(i32, i32, i32); 12],
-    /// Fluid status of each candidate center (filled lazily; mirrors `status`).
-    candidate_status: [Option<FluidStatus>; 12],
+    /// Per grid key (l, m, n) — indexed like `location` — its 12 candidate aquifer centers
+    /// in vanilla's iteration order, plus their fluid statuses (filled lazily).
+    candidate_sets: Vec<Option<Box<CandidateSet>>>,
+    /// Index of the set used by the block currently being computed.
+    current: usize,
     surface: HashMap<(i32, i32), i32>,
     /// y-independent values of the column being scanned (shared across its groups).
     scan_column: super::batch::ColumnMemo,
@@ -200,9 +205,8 @@ impl<'a> Aquifer<'a> {
             size_z,
             location: vec![None; n],
             status: vec![None; n],
-            candidates_key: None,
-            candidates: [(0, 0, 0); 12],
-            candidate_status: [None; 12],
+            candidate_sets: (0..n).map(|_| None).collect(),
+            current: 0,
             surface: HashMap::new(),
             scan_column: super::batch::ColumnMemo::new(p.nodes.len()),
         }
@@ -233,15 +237,18 @@ impl<'a> Aquifer<'a> {
         }
 
         let key = ((x - 5).div_euclid(16), (y + 1).div_euclid(12), (z - 5).div_euclid(16));
-        if self.candidates_key != Some(key) {
-            self.load_candidates(key);
+        let set = self.index(key.0, key.1, key.2);
+        if self.candidate_sets[set].is_none() {
+            self.load_candidates(set, key);
         }
+        self.current = set;
+        let candidates = self.candidate_sets[set].as_ref().unwrap().pos;
         let (mut o, mut p, mut q) = (i32::MAX, i32::MAX, i32::MAX);
         // Candidate indices of the three nearest centers (vanilla tracks the positions;
         // index 12 stands for vanilla's initial BlockPos 0 and is never selected in practice).
         let (mut r, mut s, mut t) = (12usize, 12usize, 12usize);
         // Same order as vanilla's u/v/w loops, so ties resolve identically.
-        for (ci, &pos) in self.candidates.iter().enumerate() {
+        for (ci, &pos) in candidates.iter().enumerate() {
             let (ad, ae, af) = (pos.0 - x, pos.1 - y, pos.2 - z);
             let ag = ad.wrapping_mul(ad).wrapping_add(ae.wrapping_mul(ae)).wrapping_add(af.wrapping_mul(af));
             if o >= ag {
@@ -299,15 +306,16 @@ impl<'a> Aquifer<'a> {
 
     /// The 12 aquifer centers around grid key (l, m, n), in vanilla's u/v/w loop order,
     /// computing (and caching) each center's random position on first use.
-    fn load_candidates(&mut self, (l, m, n): (i32, i32, i32)) {
+    fn load_candidates(&mut self, set: usize, (l, m, n): (i32, i32, i32)) {
+        let mut pos = [(0, 0, 0); 12];
         let mut k = 0;
         for u in 0..=1 {
             for v in -1..=1 {
                 for w in 0..=1 {
                     let (gx, gy, gz) = (l + u, m + v, n + w);
                     let idx = self.index(gx, gy, gz);
-                    self.candidates[k] = match self.location[idx] {
-                        Some(pos) => pos,
+                    pos[k] = match self.location[idx] {
+                        Some(p) => p,
                         None => {
                             let mut rng = self.cfg.aquifer_random.at(gx, gy, gz);
                             // Java evaluates the asLong arguments left to right.
@@ -322,21 +330,23 @@ impl<'a> Aquifer<'a> {
                 }
             }
         }
-        self.candidates_key = Some((l, m, n));
-        self.candidate_status = [None; 12];
+        self.candidate_sets[set] = Some(Box::new(CandidateSet { pos, status: [None; 12] }));
     }
 
-    /// Fluid status of candidate `ci` (12 = vanilla's BlockPos 0 fallback).
+    /// Fluid status of candidate `ci` of the current set (12 = vanilla's BlockPos 0 fallback).
     #[inline]
     fn candidate_fluid(&mut self, ci: usize) -> FluidStatus {
         if ci == 12 {
             return self.aquifer_status((0, 0, 0));
         }
-        if let Some(s) = self.candidate_status[ci] {
+        let set = self.current;
+        let cs = self.candidate_sets[set].as_ref().unwrap();
+        if let Some(s) = cs.status[ci] {
             return s;
         }
-        let s = self.aquifer_status(self.candidates[ci]);
-        self.candidate_status[ci] = Some(s);
+        let pos = cs.pos[ci];
+        let s = self.aquifer_status(pos);
+        self.candidate_sets[set].as_mut().unwrap().status[ci] = Some(s);
         s
     }
 
