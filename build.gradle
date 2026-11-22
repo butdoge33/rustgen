@@ -17,38 +17,59 @@ dependencies {
 
 // ---------------------------------------------------------------------------
 // Native (Rust) library
-// Builds native/ with cargo and packages it at /natives/<platform>/<file>
-// inside the mod jar. NativeLib.java extracts and loads it at runtime.
-// For now only the host platform is built; cross-builds come later.
+// Builds native/ with cargo for the host plus any cross targets, and packages each at
+// /natives/<platform>/<file> inside the mod jar. NativeLib.java extracts and loads the
+// one matching the running platform (or falls back to vanilla if there is none).
+//
+// Cross targets: -Prustgen.crossTargets=windows-x86_64 (comma-separated; default below).
+//   windows-x86_64: rustup target add x86_64-pc-windows-gnu + gcc-mingw-w64-x86-64.
 // ---------------------------------------------------------------------------
 def osName = System.getProperty("os.name").toLowerCase(Locale.ROOT)
 def osArch = System.getProperty("os.arch").toLowerCase(Locale.ROOT)
 def nativeOs = osName.contains("win") ? "windows" : (osName.contains("mac") ? "macos" : "linux")
 def nativeArch = (osArch == "amd64" || osArch == "x86_64") ? "x86_64" : osArch
-def nativeFile = nativeOs == "windows" ? "rustgen.dll" : (nativeOs == "macos" ? "librustgen.dylib" : "librustgen.so")
+def hostPlatform = "${nativeOs}-${nativeArch}"
 def nativeOutDir = layout.buildDirectory.dir("generated/natives")
 
-def cargoBuild = tasks.register("cargoBuild", Exec) {
-	group = "build"
-	description = "Builds the Rust native library (release)."
-	workingDir = file("native")
-	commandLine "cargo", "build", "--release"
-	inputs.dir("native/src")
-	inputs.file("native/Cargo.toml")
-	outputs.file("native/target/release/${nativeFile}")
+// platform -> [rust target triple (null = host), library file name]
+def nativeTargets = [
+	"linux-x86_64"  : ["x86_64-unknown-linux-gnu", "librustgen.so"],
+	"windows-x86_64": ["x86_64-pc-windows-gnu", "rustgen.dll"],
+	"macos-x86_64"  : ["x86_64-apple-darwin", "librustgen.dylib"],
+	"macos-aarch64" : ["aarch64-apple-darwin", "librustgen.dylib"],
+]
+def requested = (findProperty("rustgen.crossTargets") ?: (hostPlatform == "linux-x86_64" ? "windows-x86_64" : ""))
+		.toString().split(",").collect { it.trim() }.findAll { it && it != hostPlatform }
+def platforms = [hostPlatform] + requested
+
+def cargoTasks = platforms.collect { platform ->
+	def (triple, libName) = nativeTargets[platform] ?: [null, null]
+	if (libName == null) throw new GradleException("Unknown native platform '${platform}'")
+	def host = platform == hostPlatform
+	def libPath = host ? "native/target/release/${libName}" : "native/target/${triple}/release/${libName}"
+	def task = tasks.register("cargoBuild-${platform}", Exec) {
+		group = "build"
+		description = "Builds the Rust native library for ${platform} (release)."
+		workingDir = file("native")
+		commandLine(host ? ["cargo", "build", "--release"] : ["cargo", "build", "--release", "--target", triple])
+		inputs.dir("native/src")
+		inputs.file("native/Cargo.toml")
+		outputs.file(libPath)
+	}
+	[platform: platform, task: task, lib: libPath]
 }
 
 def copyNatives = tasks.register("copyNatives", Copy) {
-	dependsOn cargoBuild
+	cargoTasks.each { t -> dependsOn t.task }
 	into(nativeOutDir)
-	from("native/target/release/${nativeFile}") {
-		into("natives/${nativeOs}-${nativeArch}")
+	cargoTasks.each { t ->
+		from(t.lib) { into("natives/${t.platform}") }
 	}
 }
 
-// Passing the task (not just the dir) makes every consumer of main resources
-// (processResources, sourcesJar, ...) depend on copyNatives automatically.
 sourceSets.main.resources.srcDir(copyNatives)
+// Binaries don't belong in the sources jar.
+tasks.matching { it.name == "sourcesJar" }.configureEach { exclude("natives/**") }
 
 processResources {
 	def version = project.version

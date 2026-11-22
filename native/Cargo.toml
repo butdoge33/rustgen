@@ -17,6 +17,8 @@ codegen-units = 1
 # Keep unwinding so panics can be caught and turned into Java exceptions
 # instead of killing the game.
 panic = "unwind"
+# Smaller library; JNI entry points stay in the dynamic symbol / export table.
+strip = "symbols"
 
 [features]
 # Phase timers for chunk fills (corners / block densities / materials / surface scans),
