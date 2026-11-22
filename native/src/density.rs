@@ -951,6 +951,27 @@ impl Program {
 
         // Block positions of one cell: (x, y, z, dx, dy, dz, output index).
         let mut cell_pos: Vec<(i32, i32, i32, f64, f64, f64, usize)> = Vec::with_capacity((w * w * h) as usize);
+        // In-cell offsets, interpolation weights and output-index offsets: identical for
+        // every cell, so computed once. Order: ty, tx, tz (any order is fine; pure).
+        let mut template: Vec<(i32, i32, i32, f64, f64, f64, usize)> = Vec::with_capacity((w * w * h) as usize);
+        for ty in 0..h {
+            for tx in 0..w {
+                for tz in 0..w {
+                    let off = (ty as usize * width + tz as usize) * width + tx as usize;
+                    template.push((tx, ty, tz, tx as f64 / w as f64, ty as f64 / h as f64, tz as f64 / w as f64, off));
+                }
+            }
+        }
+        let template_weights: Vec<([f64; batch::L], [f64; batch::L], [f64; batch::L])> = template
+            .chunks(batch::L)
+            .map(|c| {
+                let (mut dx, mut dy, mut dz) = ([0.0; batch::L], [0.0; batch::L], [0.0; batch::L]);
+                for (k, t) in c.iter().enumerate() {
+                    (dx[k], dy[k], dz[k]) = (t.3, t.4, t.5);
+                }
+                (dx, dy, dz)
+            })
+            .collect();
         let mut buf2 = [0.0f64; batch::L];
 
         for cx in 0..nxz {
@@ -969,34 +990,26 @@ impl Program {
                             g[gidx(cx + 1, cz + 1, cy + 1)], // n111
                         ];
                     }
+                    // Lane template + this cell's origin (template built once per chunk).
+                    let (ox, oy, oz) = ((first_cell_x + cx as i32) * w, (p.cell_noise_min_y + cy as i32) * h, (first_cell_z + cz as i32) * w);
+                    let base = ((oy - min_y) as usize * width + (oz - p.min_block_z) as usize) * width + (ox - p.min_block_x) as usize;
                     cell_pos.clear();
-                    for ty in 0..h {
-                        let y = (p.cell_noise_min_y + cy as i32) * h + ty;
-                        for tx in 0..w {
-                            let x = (first_cell_x + cx as i32) * w + tx;
-                            for tz in 0..w {
-                                let z = (first_cell_z + cz as i32) * w + tz;
-                                let idx = ((y - min_y) as usize * width + (z - p.min_block_z) as usize) * width
-                                    + (x - p.min_block_x) as usize;
-                                cell_pos.push((x, y, z, tx as f64 / w as f64, ty as f64 / h as f64, tz as f64 / w as f64, idx));
-                            }
-                        }
-                    }
+                    cell_pos.extend(template.iter().map(|t| (ox + t.0, oy + t.1, oz + t.2, t.3, t.4, t.5, base + t.6)));
 
-                    for lanes in cell_pos.chunks(batch::L) {
+                    for (chunk_no, lanes) in cell_pos.chunks(batch::L).enumerate() {
                         let n = lanes.len();
-                        let mut bl = batch::BlockLanes {
+                        let tw = &template_weights[chunk_no];
+                        let bl = batch::BlockLanes {
                             slot_of: &slot_of,
                             corners: &corners,
-                            dx: [0.0; batch::L],
-                            dy: [0.0; batch::L],
-                            dz: [0.0; batch::L],
+                            dx: tw.0,
+                            dy: tw.1,
+                            dz: tw.2,
                             lerp3: true,
                         };
                         let (mut xs, mut ys, mut zs) = ([0; batch::L], [0; batch::L], [0; batch::L]);
-                        for (k, &(x, y, z, dx, dy, dz, _)) in lanes.iter().enumerate() {
-                            (xs[k], ys[k], zs[k]) = (x, y, z);
-                            (bl.dx[k], bl.dy[k], bl.dz[k]) = (dx, dy, dz);
+                        for (k, l) in lanes.iter().enumerate() {
+                            (xs[k], ys[k], zs[k]) = (l.0, l.1, l.2);
                         }
                         let mut bt = batch::Batch {
                             xs,

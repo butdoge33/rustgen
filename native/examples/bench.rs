@@ -52,7 +52,7 @@ fn main() {
     if let Ok(target) = std::env::var("RUSTGEN_PPROF") {
         let mat_cfg = material.as_ref();
         let guard = pprof::ProfilerGuardBuilder::default().frequency(4000).build().unwrap();
-        for round in 0..4 {
+        for round in 0..12 {
             for i in 0..chunks {
                 let extra = if target == "veins" {
                     vec![(veins[0], a.as_mut_slice()), (veins[1], b.as_mut_slice()), (veins[2], c.as_mut_slice())]

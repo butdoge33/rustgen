@@ -88,17 +88,40 @@ impl ImprovedNoise {
         self.p[(i & 0xFF) as usize] as i32
     }
 
-    /// noise(x, y, z, yScale, yMax)
+    /// noise(x, y, z, yScale, yMax) — same as `noise_y(&xz_part(x, z), y, yScale, yMax)`,
+    /// which column evaluation uses to compute the x/z part once for many y.
+    #[inline]
     pub fn noise(&self, x: f64, y: f64, z: f64, y_scale: f64, y_max: f64) -> f64 {
+        self.noise_y(&self.xz_part(x, z), y, y_scale, y_max)
+    }
+
+    /// Everything noise() derives from x and z alone (identical operations, computed once).
+    #[inline]
+    pub fn xz_part(&self, x: f64, z: f64) -> XzPart {
         let dx = x + self.xo;
-        let dy = y + self.yo;
         let dz = z + self.zo;
         let ix = floor(dx);
-        let iy = floor(dy);
         let iz = floor(dz);
         let fx = dx - ix as f64;
-        let fy = dy - iy as f64;
         let fz = dz - iz as f64;
+        XzPart {
+            iz,
+            fx,
+            fz,
+            sx: smoothstep(fx),
+            sz: smoothstep(fz),
+            // Java int arithmetic wraps; mirror that explicitly.
+            l: self.perm(ix),
+            m: self.perm(ix.wrapping_add(1)),
+        }
+    }
+
+    /// The y-dependent remainder of noise(): vanilla's sampleAndLerp with the x/z part given.
+    #[inline]
+    pub fn noise_y(&self, xz: &XzPart, y: f64, y_scale: f64, y_max: f64) -> f64 {
+        let dy = y + self.yo;
+        let j = floor(dy);
+        let fy = dy - j as f64;
         let y_off = if y_scale != 0.0 {
             let r = if y_max >= 0.0 && y_max < fy { y_max } else { fy };
             // Note: vanilla adds a *float* literal 1.0E-7F here.
@@ -106,15 +129,8 @@ impl ImprovedNoise {
         } else {
             0.0
         };
-        self.sample_and_lerp(ix, iy, iz, fx, fy - y_off, fz, fy)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    fn sample_and_lerp(&self, i: i32, j: i32, k: i32, d: f64, e: f64, f: f64, g: f64) -> f64 {
-        // Java int arithmetic wraps; mirror that explicitly.
-        let l = self.perm(i);
-        let m = self.perm(i.wrapping_add(1));
+        let (d, e, f, k) = (xz.fx, fy - y_off, xz.fz, xz.iz);
+        let (l, m) = (xz.l, xz.m);
         let n = self.perm(l.wrapping_add(j));
         let o = self.perm(l.wrapping_add(j).wrapping_add(1));
         let p = self.perm(m.wrapping_add(j));
@@ -127,10 +143,19 @@ impl ImprovedNoise {
         let v = grad_dot(self.perm(p.wrapping_add(k).wrapping_add(1)), d - 1.0, e, f - 1.0);
         let w = grad_dot(self.perm(o.wrapping_add(k).wrapping_add(1)), d, e - 1.0, f - 1.0);
         let x = grad_dot(self.perm(q.wrapping_add(k).wrapping_add(1)), d - 1.0, e - 1.0, f - 1.0);
-        // Vanilla uses the *unadjusted* y fraction (g) for the y weight.
-        let sx = smoothstep(d);
-        let sy = smoothstep(g);
-        let sz = smoothstep(f);
-        lerp3(sx, sy, sz, h, r, s, t, u, v, w, x)
+        // Vanilla uses the *unadjusted* y fraction (fy) for the y weight.
+        lerp3(xz.sx, smoothstep(fy), xz.sz, h, r, s, t, u, v, w, x)
     }
+}
+
+/// The x/z-only part of an ImprovedNoise sample (see [`ImprovedNoise::xz_part`]).
+#[derive(Clone, Copy)]
+pub struct XzPart {
+    iz: i32,
+    fx: f64,
+    fz: f64,
+    sx: f64,
+    sz: f64,
+    l: i32,
+    m: i32,
 }

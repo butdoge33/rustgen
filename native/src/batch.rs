@@ -102,6 +102,48 @@ impl Lanes {
     }
 }
 
+/// Lanes of `act` satisfying a predicate: usually all or none, so avoid building a list.
+pub(super) enum Sel {
+    All,
+    Empty,
+    Some(Lanes),
+}
+
+#[inline]
+pub(super) fn select(act: Act, mut pred: impl FnMut(usize) -> bool) -> Sel {
+    let (mut yes, mut total) = (0usize, 0usize);
+    act.each(|i| {
+        total += 1;
+        if pred(i) {
+            yes += 1;
+        }
+    });
+    if yes == total {
+        Sel::All
+    } else if yes == 0 {
+        Sel::Empty
+    } else {
+        let mut l = Lanes::new();
+        act.each(|i| {
+            if pred(i) {
+                l.push(i)
+            }
+        });
+        Sel::Some(l)
+    }
+}
+
+/// Active lane indices as a dense list (for column evaluation).
+#[inline]
+fn gather(act: Act, idx: &mut [u8; L]) -> usize {
+    let mut n = 0;
+    act.each(|i| {
+        idx[n] = i as u8;
+        n += 1;
+    });
+    n
+}
+
 /// Results of shared (multi-parent) nodes for the current batch, so each is computed once.
 pub(super) struct Shared {
     slot: Vec<u32>,
@@ -221,6 +263,29 @@ impl Program {
         });
     }
 
+    /// For the `act` lanes where `need(out, lane)`: out[lane] = combine(out[lane], node c).
+    #[inline]
+    fn eval_where(
+        &self,
+        c: u32,
+        b: &Batch,
+        act: Act,
+        out: &mut [f64; L],
+        need: impl Fn(&[f64; L], usize) -> bool,
+        combine: impl Fn(f64, f64) -> f64,
+    ) {
+        let lanes = match select(act, |i| need(out, i)) {
+            Sel::Empty => return,
+            Sel::All => None,
+            Sel::Some(l) => Some(l),
+        };
+        let sub = lanes.as_ref().map_or(act, |l| l.act());
+        let mut t = b.pool.take();
+        self.evb(c, b, sub, &mut t);
+        sub.each(|i| out[i] = combine(out[i], t[i]));
+        b.pool.give(t);
+    }
+
     /// Scalar evaluation of node `n` for one lane, in the mode the batch represents.
     #[inline]
     fn scalar_lane(&self, n: u32, b: &Batch, i: usize) -> f64 {
@@ -275,38 +340,19 @@ impl Program {
             }
             Op::Mul(a, c) => {
                 self.evb(a, b, act, out);
-                let mut need = Lanes::new();
-                act.each(|i| if out[i] == 0.0 { out[i] = 0.0 } else { need.push(i) });
-                if !need.is_empty() {
-                    let mut t = b.pool.take();
-                    self.evb(c, b, need.act(), &mut t);
-                    need.act().each(|i| out[i] *= t[i]);
-                    b.pool.give(t);
-                }
+                // d == 0.0 ? 0.0 : d * arg2 — arg2 only where d != 0 (and -0.0 becomes 0.0).
+                act.each(|i| if out[i] == 0.0 { out[i] = 0.0 });
+                self.eval_where(c, b, act, out, |o, i| o[i] != 0.0, |d, v| d * v);
             }
             Op::Min(a, c) => {
                 self.evb(a, b, act, out);
                 let bound = self.nodes[c as usize].min;
-                let mut need = Lanes::new();
-                act.each(|i| if !(out[i] < bound) { need.push(i) });
-                if !need.is_empty() {
-                    let mut t = b.pool.take();
-                    self.evb(c, b, need.act(), &mut t);
-                    need.act().each(|i| out[i] = java_min(out[i], t[i]));
-                    b.pool.give(t);
-                }
+                self.eval_where(c, b, act, out, |o, i| !(o[i] < bound), java_min);
             }
             Op::Max(a, c) => {
                 self.evb(a, b, act, out);
                 let bound = self.nodes[c as usize].max;
-                let mut need = Lanes::new();
-                act.each(|i| if !(out[i] > bound) { need.push(i) });
-                if !need.is_empty() {
-                    let mut t = b.pool.take();
-                    self.evb(c, b, need.act(), &mut t);
-                    need.act().each(|i| out[i] = java_max(out[i], t[i]));
-                    b.pool.give(t);
-                }
+                self.eval_where(c, b, act, out, |o, i| !(o[i] > bound), java_max);
             }
             Op::AddConst(i, c) => {
                 self.evb(i, b, act, out);
@@ -318,7 +364,15 @@ impl Program {
             }
             Op::Mapped(kind, i) => {
                 self.evb(i, b, act, out);
-                act.each(|j| out[j] = map_value(kind, out[j]));
+                // Match once per batch, not per lane (same formulas as map_value).
+                match kind {
+                    MapKind::Abs => act.each(|j| out[j] = map_value(MapKind::Abs, out[j])),
+                    MapKind::Square => act.each(|j| out[j] = map_value(MapKind::Square, out[j])),
+                    MapKind::Cube => act.each(|j| out[j] = map_value(MapKind::Cube, out[j])),
+                    MapKind::HalfNegative => act.each(|j| out[j] = map_value(MapKind::HalfNegative, out[j])),
+                    MapKind::QuarterNegative => act.each(|j| out[j] = map_value(MapKind::QuarterNegative, out[j])),
+                    MapKind::Squeeze => act.each(|j| out[j] = map_value(MapKind::Squeeze, out[j])),
+                }
             }
             Op::Clamp(i, lo, hi) => {
                 self.evb(i, b, act, out);
@@ -342,7 +396,21 @@ impl Program {
             }
             Op::Noise(Some(k), xz, ysc) => {
                 let noise = &self.noises[k as usize];
-                act.each(|i| out[i] = noise.get_value(xs[i] as f64 * xz, ys[i] as f64 * ysc, zs[i] as f64 * xz));
+                if b.uniform_xz {
+                    let mut idx = [0u8; L];
+                    let n = gather(act, &mut idx);
+                    let (mut yin, mut res) = ([0.0f64; L], [0.0f64; L]);
+                    for q in 0..n {
+                        yin[q] = ys[idx[q] as usize] as f64 * ysc;
+                    }
+                    let f = idx[0] as usize;
+                    noise.get_value_column(xs[f] as f64 * xz, zs[f] as f64 * xz, &yin[..n], &mut res);
+                    for q in 0..n {
+                        out[idx[q] as usize] = res[q];
+                    }
+                } else {
+                    act.each(|i| out[i] = noise.get_value(xs[i] as f64 * xz, ys[i] as f64 * ysc, zs[i] as f64 * xz));
+                }
             }
             Op::ShiftedNoise { sx, sy, sz, xz_scale, y_scale, noise: Some(k) } => {
                 let (mut tx, mut ty) = (b.pool.take(), b.pool.take());
@@ -350,24 +418,51 @@ impl Program {
                 self.evb(sy, b, act, &mut ty);
                 self.evb(sz, b, act, out);
                 let noise = &self.noises[k as usize];
-                act.each(|i| {
-                    let d = xs[i] as f64 * xz_scale + tx[i];
-                    let e = ys[i] as f64 * y_scale + ty[i];
-                    let f = zs[i] as f64 * xz_scale + out[i];
-                    out[i] = noise.get_value(d, e, f);
-                });
+                let mut idx = [0u8; L];
+                let n = gather(act, &mut idx);
+                let f0 = idx[0] as usize;
+                let d0 = xs[f0] as f64 * xz_scale + tx[f0];
+                let z0 = zs[f0] as f64 * xz_scale + out[f0];
+                // Column path only if every lane's x and z inputs are bit-identical.
+                let uniform = b.uniform_xz
+                    && idx[..n].iter().all(|&q| {
+                        let q = q as usize;
+                        (xs[q] as f64 * xz_scale + tx[q]).to_bits() == d0.to_bits()
+                            && (zs[q] as f64 * xz_scale + out[q]).to_bits() == z0.to_bits()
+                    });
+                if uniform {
+                    let (mut yin, mut res) = ([0.0f64; L], [0.0f64; L]);
+                    for q in 0..n {
+                        let l = idx[q] as usize;
+                        yin[q] = ys[l] as f64 * y_scale + ty[l];
+                    }
+                    noise.get_value_column(d0, z0, &yin[..n], &mut res);
+                    for q in 0..n {
+                        out[idx[q] as usize] = res[q];
+                    }
+                } else {
+                    act.each(|i| {
+                        let d = xs[i] as f64 * xz_scale + tx[i];
+                        let e = ys[i] as f64 * y_scale + ty[i];
+                        let f = zs[i] as f64 * xz_scale + out[i];
+                        out[i] = noise.get_value(d, e, f);
+                    });
+                }
                 b.pool.give(tx);
                 b.pool.give(ty);
             }
             Op::RangeChoice { input, min_inclusive, max_exclusive, in_range, out_of_range } => {
                 self.evb(input, b, act, out);
-                let (mut inside, mut outside) = (Lanes::new(), Lanes::new());
-                act.each(|i| if out[i] >= min_inclusive && out[i] < max_exclusive { inside.push(i) } else { outside.push(i) });
-                if !inside.is_empty() {
-                    self.evb(in_range, b, inside.act(), out);
-                }
-                if !outside.is_empty() {
-                    self.evb(out_of_range, b, outside.act(), out);
+                let inside = |o: &[f64; L], i: usize| o[i] >= min_inclusive && o[i] < max_exclusive;
+                match select(act, |i| inside(out, i)) {
+                    Sel::All => self.evb(in_range, b, act, out),
+                    Sel::Empty => self.evb(out_of_range, b, act, out),
+                    Sel::Some(ins) => {
+                        let mut outs = Lanes::new();
+                        act.each(|i| if !inside(out, i) { outs.push(i) });
+                        self.evb(in_range, b, ins.act(), out);
+                        self.evb(out_of_range, b, outs.act(), out);
+                    }
                 }
             }
             Op::Slide(i, settings) => {
@@ -388,6 +483,19 @@ impl Program {
                 let t = (ys[i] as f64 - from_y as f64) / (to_y as f64 - from_y as f64);
                 out[i] = clamped_lerp(from_value, to_value, t);
             }),
+            Op::OldBlendedNoise(bi) if b.uniform_xz => {
+                let mut idx = [0u8; L];
+                let n = gather(act, &mut idx);
+                let (mut yin, mut res) = ([0i32; L], [0.0f64; L]);
+                for q in 0..n {
+                    yin[q] = ys[idx[q] as usize];
+                }
+                let f = idx[0] as usize;
+                self.blended[bi as usize].compute_column(xs[f], zs[f], &yin[..n], &mut res);
+                for q in 0..n {
+                    out[idx[q] as usize] = res[q];
+                }
+            }
             Op::BlendAlpha => act.each(|i| out[i] = 1.0),
             Op::BlendOffset => act.each(|i| out[i] = 0.0),
             Op::BlendDensity(i) => self.evb(i, b, act, out),

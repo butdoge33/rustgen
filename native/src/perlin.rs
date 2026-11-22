@@ -141,6 +141,28 @@ impl PerlinNoise {
         self.noise_levels[self.noise_levels.len() - 1 - i].as_ref()
     }
 
+    /// getValue(x, ys[k], z) for every k into out[k]: the x/z work of each octave is done
+    /// once. Each lane performs exactly the operations of [`PerlinNoise::get_value`].
+    pub fn get_value_column(&self, x: f64, z: f64, ys: &[f64], out: &mut [f64]) {
+        let n = ys.len();
+        out[..n].fill(0.0);
+        let mut input = self.lowest_freq_input_factor;
+        let mut value = self.lowest_freq_value_factor;
+        for (l, lvl) in self.noise_levels.iter().enumerate() {
+            if let Some(noise) = lvl {
+                let xz = noise.xz_part(wrap(x * input), wrap(z * input));
+                let amp = self.amplitudes[l];
+                let zero = 0.0 * input;
+                for k in 0..n {
+                    let m = noise.noise_y(&xz, wrap(ys[k] * input), zero, zero);
+                    out[k] += amp * m * value;
+                }
+            }
+            input *= 2.0;
+            value /= 2.0;
+        }
+    }
+
     /// getValue(x, y, z)
     pub fn get_value(&self, x: f64, y: f64, z: f64) -> f64 {
         let mut total = 0.0;
@@ -205,6 +227,23 @@ impl NormalNoise {
 
     pub fn max_value(&self) -> f64 {
         self.max_value
+    }
+
+    /// getValue(x, ys[k], z) for every k (at most 128) into out[k]; see
+    /// [`PerlinNoise::get_value_column`].
+    pub fn get_value_column(&self, x: f64, z: f64, ys: &[f64], out: &mut [f64]) {
+        let n = ys.len();
+        assert!(n <= 128, "column too long");
+        let mut hs = [0.0f64; 128];
+        for k in 0..n {
+            hs[k] = ys[k] * INPUT_FACTOR;
+        }
+        let mut second = [0.0f64; 128];
+        self.first.get_value_column(x, z, ys, out);
+        self.second.get_value_column(x * INPUT_FACTOR, z * INPUT_FACTOR, &hs[..n], &mut second);
+        for k in 0..n {
+            out[k] = (out[k] + second[k]) * self.value_factor;
+        }
     }
 
     /// getValue(x, y, z)

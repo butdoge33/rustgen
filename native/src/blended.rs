@@ -85,6 +85,65 @@ impl BlendedNoise {
         -self.max_value
     }
 
+    /// compute() at (block_x, ys[k], block_z) for every k (at most 128) into out[k], doing the
+    /// x/z work of each octave once. Each lane performs exactly the operations of compute().
+    pub fn compute_column(&self, block_x: i32, block_z: i32, ys: &[i32], out: &mut [f64]) {
+        let n = ys.len();
+        assert!(n <= 128, "column too long");
+        let i = block_x.div_euclid(self.cell_width) as f64;
+        let k = block_z.div_euclid(self.cell_width) as f64;
+        let mut js = [0.0f64; 128];
+        for q in 0..n {
+            js[q] = ys[q].div_euclid(self.cell_height) as f64;
+        }
+        let (mut d, mut e, mut f) = ([0.0f64; 128], [0.0f64; 128], [0.0f64; 128]);
+
+        let mut g = 1.0;
+        for l in 0..8 {
+            if let Some(noise) = self.main.octave_noise(l) {
+                let xz = noise.xz_part(wrap(i * self.xz_main_scale * g), wrap(k * self.xz_main_scale * g));
+                let scale = self.y_main_scale * g;
+                for q in 0..n {
+                    // vanilla: wrap(j * yMainScale * g), yMainScale * g, j * yMainScale * g
+                    let y = wrap(js[q] * self.y_main_scale * g);
+                    f[q] += noise.noise_y(&xz, y, scale, js[q] * self.y_main_scale * g) / g;
+                }
+            }
+            g /= 2.0;
+        }
+
+        let mut h = [0.0f64; 128];
+        for q in 0..n {
+            h[q] = (f[q] / 10.0 + 1.0) / 2.0;
+        }
+        g = 1.0;
+        for m in 0..16 {
+            let nx = wrap(i * self.xz_scale * g);
+            let pz = wrap(k * self.xz_scale * g);
+            let qs = self.y_scale * g;
+            let min_n = self.min_limit.octave_noise(m).map(|nz| (nz, nz.xz_part(nx, pz)));
+            let max_n = self.max_limit.octave_noise(m).map(|nz| (nz, nz.xz_part(nx, pz)));
+            for q in 0..n {
+                let o = wrap(js[q] * self.y_scale * g);
+                // vanilla: noise(n, o, p, q, j * q) with q = yScale * g
+                if !(h[q] >= 1.0) {
+                    if let Some((nz, xz)) = &min_n {
+                        d[q] += nz.noise_y(xz, o, qs, js[q] * qs) / g;
+                    }
+                }
+                if !(h[q] <= 0.0) {
+                    if let Some((nz, xz)) = &max_n {
+                        e[q] += nz.noise_y(xz, o, qs, js[q] * qs) / g;
+                    }
+                }
+            }
+            g /= 2.0;
+        }
+        for q in 0..n {
+            out[q] = clamped_lerp(d[q] / 512.0, e[q] / 512.0, h[q]) / 128.0;
+        }
+    }
+
     /// compute(FunctionContext)
     pub fn compute(&self, block_x: i32, block_y: i32, block_z: i32) -> f64 {
         let i = block_x.div_euclid(self.cell_width) as f64; // Math.floorDiv, positive divisor
