@@ -72,7 +72,16 @@ public final class NativeRouter {
 	 */
 	public static NativeRouter create(Object owner, NoiseRouter router, NoiseGeneratorSettings settings, Aquifer.FluidPicker fluidPicker,
 			String name) {
-		if (!NativeLib.isAvailable()) return null;
+		return create(owner, router, settings, fluidPicker, name, new String[1]);
+	}
+
+	/** As above; when returning null, {@code why[0]} receives a short reason for the user. */
+	public static NativeRouter create(Object owner, NoiseRouter router, NoiseGeneratorSettings settings, Aquifer.FluidPicker fluidPicker,
+			String name, String[] why) {
+		if (!NativeLib.isAvailable()) {
+			why[0] = "native library not available on " + NativeLib.platform();
+			return null;
+		}
 		NativeDensity nd = null;
 		try {
 			DensityTranslator.Result tr = DensityTranslator.translate(router);
@@ -84,8 +93,8 @@ public final class NativeRouter {
 			if (veins) for (int v : VEINS) require(tr, nd, v, true);
 			if (aquifers) {
 				for (int r : new int[] {BARRIER, FLOODEDNESS, SPREAD, LAVA, INITIAL}) require(tr, nd, r, false);
-				String why = nd.checkSurfaceRoot(INITIAL);
-				if (why != null) throw new Unsupported("initial_density_without_jaggedness: " + why);
+				String surfaceWhy = nd.checkSurfaceRoot(INITIAL);
+				if (surfaceWhy != null) throw new Unsupported("initial_density_without_jaggedness: " + surfaceWhy);
 			}
 
 			int defaultFluid = fluidCode(settings.defaultFluid());
@@ -118,10 +127,12 @@ public final class NativeRouter {
 		} catch (Unsupported e) {
 			if (nd != null) nd.close();
 			LOG.info("[rustgen] {}: using vanilla noise fill ({})", name, e.getMessage());
+			why[0] = e.getMessage();
 			return null;
 		} catch (RuntimeException e) {
 			if (nd != null) nd.close();
 			LOG.error("[rustgen] {}: failed to compile noise router, using vanilla", name, e);
+			why[0] = "internal error, see log";
 			return null;
 		}
 	}

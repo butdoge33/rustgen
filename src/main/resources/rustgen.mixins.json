@@ -5,6 +5,7 @@
 	"mixins": [
 		"BeardifierAccessor",
 		"BlendedNoiseAccessor",
+		"ChunkStatusMixin",
 		"FluidStatusAccessor",
 		"ImprovedNoiseAccessor",
 		"NoiseBasedChunkGeneratorMixin",
@@ -16,5 +17,9 @@
 	],
 	"injectors": {
 		"defaultRequire": 1
-	}
+	},
+	"client": [
+		"client.DebugScreenOverlayMixin",
+		"client.VideoSettingsScreenMixin"
+	]
 }
