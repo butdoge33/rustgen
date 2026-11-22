@@ -1,7 +1,0 @@
-{
-	"options.rustgen.worldgen": "Geração de Mundo",
-	"options.rustgen.worldgen.rust": "Rust",
-	"options.rustgen.worldgen.java": "Java",
-	"options.rustgen.worldgen.rust.tooltip": "Novos chunks são gerados pelo gerador de terreno nativo (Rust) do rustgen. Os chunks são idênticos aos do vanilla.",
-	"options.rustgen.worldgen.java.tooltip": "Novos chunks são gerados pelo gerador de terreno do próprio Minecraft (Java)."
-}
