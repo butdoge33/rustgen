@@ -47,8 +47,8 @@ run_one() { # $1 = Native | Vanilla, $2 = pair index
     echo "pair $i  $mode  (timed out; thread dump in $OUT/$mode-$i.jstack.txt)" | tee -a "$SUMMARY"
   fi
   local rate fill
-  rate=$(grep -oE '[0-9]+,?[0-9]* chunks/s' "$log" | tail -1)
-  fill=$(grep -oE 'doFill [0-9.,]+ ms/chunk' "$log" | tail -1)
+  rate=$(grep -oE '[0-9]+([.,][0-9]+)? chunks/s' "$log" | tail -1)
+  fill=$(grep -oE 'doFill [0-9]+([.,][0-9]+)? ms/chunk' "$log" | tail -1)
   echo "pair $i  $mode  ${rate:-FAILED}  ${fill:-}" | tee -a "$SUMMARY"
 }
 
