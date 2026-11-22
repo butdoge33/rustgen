@@ -130,6 +130,9 @@ fn clamped_map(d: f64, e: f64, f: f64, g: f64, h: f64) -> f64 {
     clamped_lerp(g, h, (d - e) / (f - e))
 }
 
+/// Levels evaluated per batch in the preliminary-surface scan.
+const SCAN_GROUP: usize = 16;
+
 /// NoiseBasedAquifer.SURFACE_SAMPLING_OFFSETS_IN_CHUNKS
 const SURFACE_OFFSETS: [(i32, i32); 13] = [
     (-2, -1), (-1, -1), (0, -1), (1, -1), (-3, 0), (-2, 0), (-1, 0), (0, 0), (1, 0), (-2, 1), (-1, 1), (0, 1), (1, 1),
@@ -150,7 +153,15 @@ pub(super) struct Aquifer<'a> {
     size_z: i32,
     location: Vec<Option<(i32, i32, i32)>>,
     status: Vec<Option<FluidStatus>>,
+    /// The 12 candidate aquifer centers of the last grid key (l, m, n), in vanilla's
+    /// iteration order. Consecutive blocks almost always share the key.
+    candidates_key: Option<(i32, i32, i32)>,
+    candidates: [(i32, i32, i32); 12],
+    /// Fluid status of each candidate center (filled lazily; mirrors `status`).
+    candidate_status: [Option<FluidStatus>; 12],
     surface: HashMap<(i32, i32), i32>,
+    /// y-independent values of the column being scanned (shared across its groups).
+    scan_column: super::batch::ColumnMemo,
 }
 
 impl<'a> Aquifer<'a> {
@@ -189,7 +200,11 @@ impl<'a> Aquifer<'a> {
             size_z,
             location: vec![None; n],
             status: vec![None; n],
+            candidates_key: None,
+            candidates: [(0, 0, 0); 12],
+            candidate_status: [None; 12],
             surface: HashMap::new(),
+            scan_column: super::batch::ColumnMemo::new(p.nodes.len()),
         }
     }
 
@@ -217,51 +232,37 @@ impl<'a> Aquifer<'a> {
             return (Some(Fluid::Lava), false);
         }
 
-        let l = (x - 5).div_euclid(16);
-        let m = (y + 1).div_euclid(12);
-        let n = (z - 5).div_euclid(16);
+        let key = ((x - 5).div_euclid(16), (y + 1).div_euclid(12), (z - 5).div_euclid(16));
+        if self.candidates_key != Some(key) {
+            self.load_candidates(key);
+        }
         let (mut o, mut p, mut q) = (i32::MAX, i32::MAX, i32::MAX);
-        let (mut r, mut s, mut t) = ((0, 0, 0), (0, 0, 0), (0, 0, 0));
-        for u in 0..=1 {
-            for v in -1..=1 {
-                for w in 0..=1 {
-                    let (gx, gy, gz) = (l + u, m + v, n + w);
-                    let idx = self.index(gx, gy, gz);
-                    let pos = match self.location[idx] {
-                        Some(pos) => pos,
-                        None => {
-                            let mut rng = self.cfg.aquifer_random.at(gx, gy, gz);
-                            // Java evaluates the asLong arguments left to right.
-                            let px = gx * 16 + rng.next_int_bounded(10);
-                            let py = gy * 12 + rng.next_int_bounded(9);
-                            let pz = gz * 16 + rng.next_int_bounded(10);
-                            self.location[idx] = Some((px, py, pz));
-                            (px, py, pz)
-                        }
-                    };
-                    let (ad, ae, af) = (pos.0 - x, pos.1 - y, pos.2 - z);
-                    let ag = ad.wrapping_mul(ad).wrapping_add(ae.wrapping_mul(ae)).wrapping_add(af.wrapping_mul(af));
-                    if o >= ag {
-                        t = s;
-                        s = r;
-                        r = pos;
-                        q = p;
-                        p = o;
-                        o = ag;
-                    } else if p >= ag {
-                        t = s;
-                        s = pos;
-                        q = p;
-                        p = ag;
-                    } else if q >= ag {
-                        t = pos;
-                        q = ag;
-                    }
-                }
+        // Candidate indices of the three nearest centers (vanilla tracks the positions;
+        // index 12 stands for vanilla's initial BlockPos 0 and is never selected in practice).
+        let (mut r, mut s, mut t) = (12usize, 12usize, 12usize);
+        // Same order as vanilla's u/v/w loops, so ties resolve identically.
+        for (ci, &pos) in self.candidates.iter().enumerate() {
+            let (ad, ae, af) = (pos.0 - x, pos.1 - y, pos.2 - z);
+            let ag = ad.wrapping_mul(ad).wrapping_add(ae.wrapping_mul(ae)).wrapping_add(af.wrapping_mul(af));
+            if o >= ag {
+                t = s;
+                s = r;
+                r = ci;
+                q = p;
+                p = o;
+                o = ag;
+            } else if p >= ag {
+                t = s;
+                s = ci;
+                q = p;
+                p = ag;
+            } else if q >= ag {
+                t = ci;
+                q = ag;
             }
         }
 
-        let status_r = self.aquifer_status(r);
+        let status_r = self.candidate_fluid(r);
         let e = similarity(o, p);
         let state = status_r.at(y);
         if e <= 0.0 {
@@ -273,12 +274,12 @@ impl<'a> Aquifer<'a> {
         }
 
         let mut barrier = f64::NAN; // MutableDouble(NaN): computed at most once per block
-        let status_s = self.aquifer_status(s);
+        let status_s = self.candidate_fluid(s);
         let f = e * self.pressure(x, y, z, &mut barrier, status_r, status_s);
         if d + f > 0.0 {
             return (None, false);
         }
-        let status_t = self.aquifer_status(t);
+        let status_t = self.candidate_fluid(t);
         let g = similarity(o, q);
         if g > 0.0 {
             let h = e * g * self.pressure(x, y, z, &mut barrier, status_r, status_t);
@@ -294,6 +295,49 @@ impl<'a> Aquifer<'a> {
             }
         }
         (Some(state), true)
+    }
+
+    /// The 12 aquifer centers around grid key (l, m, n), in vanilla's u/v/w loop order,
+    /// computing (and caching) each center's random position on first use.
+    fn load_candidates(&mut self, (l, m, n): (i32, i32, i32)) {
+        let mut k = 0;
+        for u in 0..=1 {
+            for v in -1..=1 {
+                for w in 0..=1 {
+                    let (gx, gy, gz) = (l + u, m + v, n + w);
+                    let idx = self.index(gx, gy, gz);
+                    self.candidates[k] = match self.location[idx] {
+                        Some(pos) => pos,
+                        None => {
+                            let mut rng = self.cfg.aquifer_random.at(gx, gy, gz);
+                            // Java evaluates the asLong arguments left to right.
+                            let px = gx * 16 + rng.next_int_bounded(10);
+                            let py = gy * 12 + rng.next_int_bounded(9);
+                            let pz = gz * 16 + rng.next_int_bounded(10);
+                            self.location[idx] = Some((px, py, pz));
+                            (px, py, pz)
+                        }
+                    };
+                    k += 1;
+                }
+            }
+        }
+        self.candidates_key = Some((l, m, n));
+        self.candidate_status = [None; 12];
+    }
+
+    /// Fluid status of candidate `ci` (12 = vanilla's BlockPos 0 fallback).
+    #[inline]
+    fn candidate_fluid(&mut self, ci: usize) -> FluidStatus {
+        if ci == 12 {
+            return self.aquifer_status((0, 0, 0));
+        }
+        if let Some(s) = self.candidate_status[ci] {
+            return s;
+        }
+        let s = self.aquifer_status(self.candidates[ci]);
+        self.candidate_status[ci] = Some(s);
+        s
     }
 
     /// NoiseBasedAquifer.calculatePressure
@@ -405,6 +449,7 @@ impl<'a> Aquifer<'a> {
         if let Some(&v) = self.surface.get(&key) {
             return v;
         }
+        let _t = crate::profile::time(crate::profile::Phase::SurfaceScan);
         let (bx, bz) = (key.0 << 2, key.1 << 2); // QuartPos.toBlock
         let s = self.cfg.surface;
         let mut result = i32::MAX; // (int) 2.147483647E9
@@ -416,9 +461,12 @@ impl<'a> Aquifer<'a> {
         use super::batch::{Act, Batch, L};
         let top = s.min_cell_y + s.cell_count_y;
         let mut k0 = top;
+        self.scan_column.reset(); // new column
         let mut out = [0.0f64; L];
         'scan: while k0 >= s.min_cell_y {
-            let n = ((k0 - s.min_cell_y + 1) as usize).min(L);
+            // Groups of 16: shares the 2D parts within a group, yet stops near the surface
+            // like vanilla's scan instead of evaluating 3D noise for every level.
+            let n = ((k0 - s.min_cell_y + 1) as usize).min(SCAN_GROUP);
             let mut bt = Batch {
                 xs: [bx; L],
                 ys: [0; L],
@@ -426,6 +474,7 @@ impl<'a> Aquifer<'a> {
                 block: None,
                 point: true,
                 uniform_xz: true,
+                column: Some(&self.scan_column),
                 memo: self.memo,
                 pool: self.pool,
                 shared: self.shared,

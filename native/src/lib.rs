@@ -7,6 +7,7 @@ pub mod blended;
 pub mod density;
 pub mod noise;
 pub mod perlin;
+pub mod profile;
 pub mod random;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};

@@ -17,3 +17,12 @@ codegen-units = 1
 # Keep unwinding so panics can be caught and turned into Java exceptions
 # instead of killing the game.
 panic = "unwind"
+
+[features]
+# Phase timers for chunk fills (corners / block densities / materials / surface scans),
+# printed by examples/bench.rs. Compiled out of normal builds.
+profile = []
+
+[dev-dependencies]
+# Sampling profiler for examples/bench.rs (SIGPROF-based; no perf/root needed). Not shipped.
+pprof = { version = "0.15", features = ["flamegraph"] }

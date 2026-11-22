@@ -142,6 +142,25 @@ impl Shared {
     }
 }
 
+/// Values of y-independent nodes for one (x, z) column, kept across several batches of
+/// the same column (e.g. the groups of a surface scan). Valid only while `uniform_xz` and
+/// the column stays the same; `reset` before each new column.
+pub(super) struct ColumnMemo {
+    val: RefCell<Vec<f64>>,
+    gen: Vec<Cell<u64>>,
+    cur: Cell<u64>,
+}
+
+impl ColumnMemo {
+    pub(super) fn new(nodes: usize) -> Self {
+        ColumnMemo { val: RefCell::new(vec![0.0; nodes]), gen: (0..nodes).map(|_| Cell::new(0)).collect(), cur: Cell::new(0) }
+    }
+    #[inline]
+    pub(super) fn reset(&self) {
+        self.cur.set(self.cur.get() + 1);
+    }
+}
+
 /// Per-lane data for block batches.
 pub(super) struct BlockLanes<'a> {
     pub(super) slot_of: &'a [u32],
@@ -163,6 +182,8 @@ pub(super) struct Batch<'a> {
     pub(super) point: bool,
     /// All lanes share one (x, z) column, so y-independent subtrees are uniform.
     pub(super) uniform_xz: bool,
+    /// Optional cross-batch memo for y-independent nodes of this column.
+    pub(super) column: Option<&'a ColumnMemo>,
     pub(super) memo: &'a Memo,
     pub(super) pool: &'a Pool,
     pub(super) shared: &'a Shared,
@@ -228,7 +249,16 @@ impl Program {
     fn evb_compute(&self, n: u32, b: &Batch, act: Act, out: &mut [f64; L]) {
         if b.uniform_xz && !self.y_dep[n as usize] {
             if let Some(i) = act.first() {
-                let v = self.scalar_lane(n, b, i);
+                let v = match b.column {
+                    Some(c) if c.gen[n as usize].get() == c.cur.get() => c.val.borrow()[n as usize],
+                    Some(c) => {
+                        let v = self.scalar_lane(n, b, i);
+                        c.val.borrow_mut()[n as usize] = v;
+                        c.gen[n as usize].set(c.cur.get());
+                        v
+                    }
+                    None => self.scalar_lane(n, b, i),
+                };
                 act.each(|j| out[j] = v);
             }
             return;

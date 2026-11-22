@@ -899,6 +899,7 @@ impl Program {
         let mut grids: Vec<Vec<f64>> = vec![vec![0.0; (nxz + 1) * (nxz + 1) * (ny + 1)]; interps.len()];
         let pool = batch::Pool::new();
         let shared = batch::Shared::new(self);
+        let corners_timer = crate::profile::time(crate::profile::Phase::Corners);
         let mut buf = [0.0f64; batch::L];
         for cx in 0..=nxz {
             let bx = (first_cell_x + cx as i32) * w;
@@ -914,6 +915,7 @@ impl Program {
                         block: None,
                         point: false,
                         uniform_xz: true,
+                        column: None,
                         memo: &memo,
                         pool: &pool,
                         shared: &shared,
@@ -933,6 +935,7 @@ impl Program {
             }
         }
 
+        drop(corners_timer);
         let min_y = p.cell_noise_min_y * h;
         let mut corners = vec![[0.0f64; 8]; interps.len()];
         let lazy_veins = out.lazy_veins;
@@ -1002,6 +1005,7 @@ impl Program {
                             block: Some(bl),
                             point: false,
                             uniform_xz: false,
+                            column: None,
                             memo: &memo,
                             pool: &pool,
                             shared: &shared,
@@ -1009,7 +1013,9 @@ impl Program {
 
                         // cacheAllInCell(add(finalDensity, beardifier)): the fillingCell (lerp3) path.
                         shared.next();
+                        let t = crate::profile::time(crate::profile::Phase::BlockDensity);
                         self.evb(final_root, &bt, batch::Act::All(n), &mut buf);
+                        drop(t);
                         for (k, l) in lanes.iter().enumerate() {
                             // Ap2(ADD, finalDensity, beardifier): d + e, always (so -0.0 + 0.0 == 0.0 as in vanilla).
                             density[l.6] = buf[k] + beardifier.map_or(0.0, |b| b[l.6]);
@@ -1094,6 +1100,7 @@ impl Program {
         let codes = &mut *m.codes;
 
         // 1. Aquifer rule (vanilla calls it for every block).
+        let aquifer_timer = crate::profile::time(crate::profile::Phase::Aquifer);
         let mut solid = batch::Lanes::new();
         for (k, l) in lanes.iter().enumerate() {
             let (state, update) = aq.compute(l.0, l.1, l.2, density[l.6]);
@@ -1106,6 +1113,8 @@ impl Program {
                 }
             };
         }
+        drop(aquifer_timer);
+        let _veins_timer = crate::profile::time(crate::profile::Phase::Veins);
         let Some(v) = &m.cfg.veins else { return };
         if solid.is_empty() {
             return;
