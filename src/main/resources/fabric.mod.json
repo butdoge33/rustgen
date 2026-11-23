@@ -4,7 +4,8 @@
 	"version": "${version}",
 	"name": "RustGen",
 	"description": "Native (Rust) implementation of world generation hot paths, with vanilla fallback.",
-	"authors": [],
+	"authors": ["nanoave"],
+	"license": "Apache-2.0",
 	"icon": "assets/rustgen/icon.png",
 	"environment": "*",
 	"entrypoints": {
